@@ -1,0 +1,1070 @@
+//
+// RT64
+//
+
+// [wcw rt] Unit tests for common/rt64_wcw_venues (venue light presets: parsing, writing, matching). Built and run with
+// the other wcw tests on every rt64 build.
+
+#include "common/rt64_wcw_venues.h"
+
+#include <set>
+#include <string>
+
+#include "wcw_test.h"
+
+using namespace RT64::WcwLogic;
+
+// The shape of No Mercy's assets/rt_lights.json: comments, a default with explicit lights, a room fallback, venues
+// that inherit from default and venues that override fields, glows and a scene anchor.
+static const char *SampleFile = R"json(
+{
+    // Default: TV lighting.
+    "default": {
+        "center": [0, 650, 0],
+        "lights": [[0, 650, 0, 2], [-320, 600, -320, 1], [320, 600, -320, 1]],
+        "size": 20,
+        "radius": 900,
+        "shadow": 0.6,
+        "characterShadow": 0.35
+    },
+    "room": { "maxExtent": 3000, "count": 3, "height": 0.85, "falloff": 300, "size": 40, "shadow": 0.8 },
+    "venues": [
+        { "name": "Raw", "match": ["B1E01BE92A6F5BE1", "5581B2F76A29CE38", "00000000000000AA"],
+          "glows": [[0, 300, 2900, 0.8, 900]] },
+        { "name": "No Mercy", "match": ["66578B3E4816988B", "00000000000000AA"] },
+        { "name": "Backstage hallway", "match": ["EF135CC7C26673E5"], "anchor": "scene",
+          "lights": [[0, 400, 0, 1], [0, 400, 600, 1]], "radius": 1500, "shadow": 0.75 }
+    ]
+}
+)json";
+
+// Same effective colors: the preset's, the rig's, each explicit light's (own or followed) and each glow's.
+static bool sameColors(const LightPreset &a, const LightPreset &b) {
+    if ((a.color != b.color) || (a.keyColor != b.keyColor) || (a.fillColor != b.fillColor) || (a.lightOwnColor != b.lightOwnColor)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < a.lights.size(); i++) {
+        if (presetLightColor(a, i) != presetLightColor(b, i)) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < a.glows.size(); i++) {
+        if (presetGlowColor(a, i) != presetGlowColor(b, i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool samePreset(const LightPreset &a, const LightPreset &b) {
+    return (a.name == b.name) && (a.match == b.match) && (a.center[0] == b.center[0]) && (a.center[1] == b.center[1]) &&
+        (a.center[2] == b.center[2]) && (a.spread == b.spread) && (a.fills == b.fills) && (a.keyWeight == b.keyWeight) &&
+        (a.lights == b.lights) && (a.size == b.size) && (a.radius == b.radius) && (a.clearance == b.clearance) &&
+        (a.falloff == b.falloff) && (a.glows == b.glows) && (a.anchorScene == b.anchorScene) && (a.shadow == b.shadow) &&
+        (a.characterShadow == b.characterShadow) && sameColors(a, b);
+}
+
+TEST_CASE("venues: parsing applies default to venues that don't override it") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    CHECK_EQ(file.venues.size(), size_t(3));
+    CHECK((file.venues[1].name) == std::string("No Mercy"));
+    CHECK_EQ(file.venues[1].lights.size(), size_t(3));
+    CHECK_NEAR(file.venues[1].radius, 900.0f, 1e-6f);
+    CHECK_NEAR(file.venues[2].radius, 1500.0f, 1e-6f);
+    CHECK(file.venues[2].anchorScene);
+    CHECK_EQ(file.venues[0].glows.size(), size_t(1));
+    CHECK(file.roomEnabled);
+    CHECK_EQ(file.roomCount, 3u);
+    CHECK_NEAR(file.roomPreset.size, 40.0f, 1e-6f);
+    CHECK_NEAR(file.roomPreset.radius, 900.0f, 1e-6f);
+}
+
+TEST_CASE("venues: write then parse gives back the same presets") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    CHECK(samePreset(again.defaultPreset, file.defaultPreset));
+    CHECK(samePreset(again.roomPreset, file.roomPreset));
+    CHECK_EQ(again.roomMaxExtent, file.roomMaxExtent);
+    CHECK_EQ(again.roomHeight, file.roomHeight);
+    CHECK_EQ(again.venues.size(), file.venues.size());
+    for (size_t i = 0; i < file.venues.size(); i++) {
+        CHECK(samePreset(again.venues[i], file.venues[i]));
+    }
+}
+
+TEST_CASE("venues: writing leaves out inherited fields, so editing default still reaches those venues") {
+    LightPresetFile file = parseLightPresets(SampleFile);
+    const std::string text = writeLightPresets(file);
+    // "No Mercy" sets nothing but its name and match list.
+    const size_t at = text.find("\"No Mercy\"");
+    CHECK(at != std::string::npos);
+    const size_t end = text.find('}', at);
+    CHECK(text.substr(at, end - at).find("radius") == std::string::npos);
+
+    file.defaultPreset.radius = 1200.0f;
+    const LightPresetFile edited = parseLightPresets(writeLightPresets(file));
+    CHECK_NEAR(edited.venues[1].radius, 1200.0f, 1e-6f);
+    CHECK_NEAR(edited.venues[2].radius, 1500.0f, 1e-6f);
+
+    // In memory, inheritDefault brings the presets in use in line with the file.
+    inheritDefault(file);
+    CHECK_NEAR(file.venues[1].radius, 1200.0f, 1e-6f);
+    CHECK_NEAR(file.venues[2].radius, 1500.0f, 1e-6f);
+    CHECK_NEAR(file.roomPreset.radius, 1200.0f, 1e-6f);
+}
+
+TEST_CASE("venues: a field edited on a venue is written even when it equals default") {
+    LightPresetFile file = parseLightPresets(SampleFile);
+    file.venues[1].radius = 900.0f;
+    file.venues[1].setFields |= FieldRadius;
+    file.defaultPreset.radius = 1200.0f;
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    CHECK_NEAR(again.venues[1].radius, 900.0f, 1e-6f);
+}
+
+TEST_CASE("venues: an edited light position round-trips at file precision") {
+    LightPresetFile file = parseLightPresets(SampleFile);
+    file.venues[2].lights[1][2] = 612.25f;
+    file.venues[2].shadow = 0.7f;
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    CHECK_NEAR(again.venues[2].lights[1][2], 612.25f, 1e-4f);
+    CHECK_NEAR(again.venues[2].shadow, 0.7f, 1e-6f);
+}
+
+TEST_CASE("venues: texture hashes are written as 16 uppercase hex digits") {
+    CHECK((formatTextureHash(0xAAull)) == std::string("00000000000000AA"));
+    CHECK((formatTextureHash(0xB1E01BE92A6F5BE1ull)) == std::string("B1E01BE92A6F5BE1"));
+}
+
+TEST_CASE("venues: textures listed by two venues don't count towards either") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    CHECK_EQ(file.venues[0].uniqueMatch.size(), size_t(2));
+    CHECK_EQ(file.venues[1].uniqueMatch.size(), size_t(1));
+}
+
+TEST_CASE("venues: the best venue needs half its unique textures, later venues win ties") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    const std::set<uint64_t> raw = { 0xB1E01BE92A6F5BE1ull, 0xAAull };
+    auto seenRaw = [&](uint64_t h) { return raw.count(h) > 0; };
+    CHECK_NEAR(venueMatchScore(file.venues[0], seenRaw), 0.5f, 1e-6f);
+    CHECK_EQ(bestVenue(file.venues, seenRaw), 0);
+
+    // Only the shared texture: no venue reaches half of its unique textures.
+    auto seenShared = [](uint64_t h) { return h == 0xAAull; };
+    CHECK_EQ(bestVenue(file.venues, seenShared), -1);
+
+    // Raw and No Mercy both fully seen: the later one wins, as before.
+    const std::set<uint64_t> both = { 0xB1E01BE92A6F5BE1ull, 0x5581B2F76A29CE38ull, 0x66578B3E4816988Bull };
+    CHECK_EQ(bestVenue(file.venues, [&](uint64_t h) { return both.count(h) > 0; }), 1);
+}
+
+TEST_CASE("outside darkness: none inside the radius, eases over the edge, full beyond it") {
+    CHECK_NEAR(outsideDarknessFactor(800.0f, 900.0f, 400.0f, 0.8f), 1.0f, 1e-6f);
+    CHECK_NEAR(outsideDarknessFactor(900.0f, 900.0f, 400.0f, 0.8f), 1.0f, 1e-6f);
+    CHECK_NEAR(outsideDarknessFactor(1100.0f, 900.0f, 400.0f, 0.8f), 0.6f, 1e-6f);
+    CHECK_NEAR(outsideDarknessFactor(1300.0f, 900.0f, 400.0f, 0.8f), 0.2f, 1e-6f);
+    CHECK_NEAR(outsideDarknessFactor(5000.0f, 900.0f, 400.0f, 0.8f), 0.2f, 1e-6f);
+    // No edge: a hard cut at the radius.
+    CHECK_NEAR(outsideDarknessFactor(901.0f, 900.0f, 0.0f, 0.5f), 0.5f, 1e-6f);
+}
+
+TEST_CASE("outside darkness: 0 is off") {
+    CHECK_NEAR(outsideDarknessFactor(3000.0f, 900.0f, 400.0f, 0.0f), 1.0f, 1e-6f);
+}
+
+TEST_CASE("outside darkness: set per venue, inherited from default otherwise, and round-trips") {
+    LightPresetFile file = parseLightPresets(SampleFile);
+    CHECK_NEAR(file.venues[1].outsideDarkness, 0.0f, 1e-6f);
+    file.defaultPreset.outsideDarkness = 0.7f;
+    file.defaultPreset.setFields |= FieldOutsideDarkness;
+    file.venues[0].outsideDarkness = 0.3f;
+    file.venues[0].setFields |= FieldOutsideDarkness;
+    inheritDefault(file);
+    CHECK_NEAR(file.venues[1].outsideDarkness, 0.7f, 1e-6f);
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    CHECK_NEAR(again.venues[0].outsideDarkness, 0.3f, 1e-6f);
+    CHECK_NEAR(again.venues[1].outsideDarkness, 0.7f, 1e-6f);
+    CHECK_NEAR(again.venues[1].outsideEdge, 400.0f, 1e-6f);
+}
+
+TEST_CASE("outside darkness: a miss over the ring mat stays lit, a miss towards the stands darkens (mat went grey)") {
+    // Camera 600 up, 1500 back from the ring center, floor at 0.
+    const float eye[3] = { 0.0f, 600.0f, -1500.0f };
+    // Looking down at the ring center: lands at the center.
+    const float atRing[3] = { 0.0f, -0.371391f, 0.928477f };
+    CHECK_NEAR(missFloorDistance(eye, atRing, 0.0f, 0.0f, 0.0f), 0.0f, 1.0f);
+    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, atRing, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 1.0f, 1e-6f);
+    // Level or upward rays (the stands across the arena) never reach the floor: fully dark.
+    const float level[3] = { 0.0f, 0.0f, 1.0f };
+    const float up[3] = { 0.0f, 0.3f, 0.95f };
+    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, level, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 0.45f, 1e-6f);
+    CHECK_NEAR(outsideDarknessFactor(missFloorDistance(eye, up, 0.0f, 0.0f, 0.0f), 650.0f, 500.0f, 0.55f), 0.45f, 1e-6f);
+    // A shallow downward ray landing beyond the ring and the edge: fully dark.
+    const float shallow[3] = { 0.0f, -0.1f, 0.995f };
+    CHECK(missFloorDistance(eye, shallow, 0.0f, 0.0f, 0.0f) > 1150.0f);
+}
+
+TEST_CASE("outside darkness: misses darken on last frame's arena pass, not the first pass (crowd stayed lit)") {
+    MissDarkeningPass passes;
+    // Frame 1 (No Mercy shape): passes 0..4 with 4, 8, 9, 76, 3 meshes. No choice yet.
+    const size_t meshes[] = { 4, 8, 9, 76, 3 };
+    for (uint32_t i = 0; i < 5; i++) {
+        CHECK(!passes.darkenThisPass(100, i, meshes[i]));
+    }
+
+    // Frame 2: only the arena pass (3) darkens.
+    for (uint32_t i = 0; i < 5; i++) {
+        CHECK_EQ(passes.darkenThisPass(101, i, meshes[i]), i == 3);
+    }
+}
+
+TEST_CASE("outside darkness: two near-equal passes don't trade the darkening frame to frame (background flickered)") {
+    MissDarkeningPass passes;
+    uint32_t switches = 0;
+    bool lastFirst = false;
+    for (uint64_t frame = 0; frame < 120; frame++) {
+        // Pass 1 and pass 3 alternate between 44 and 45 meshes.
+        const size_t a = (frame % 2) ? 44 : 45;
+        const size_t b = (frame % 2) ? 45 : 44;
+        const bool first = passes.darkenThisPass(frame, 1, a);
+        const bool second = passes.darkenThisPass(frame, 3, b);
+        CHECK(!(first && second));
+        if ((frame > 1) && (first != lastFirst)) {
+            switches++;
+        }
+
+        lastFirst = first;
+    }
+
+    CHECK_EQ(switches, 0u);
+}
+
+TEST_CASE("outside darkness: the arena pass follows a real scene change after a short delay") {
+    MissDarkeningPass passes;
+    passes.darkenThisPass(1, 0, 50);
+    passes.darkenThisPass(1, 1, 10);
+    CHECK(passes.darkenThisPass(2, 0, 50));
+    // The scene changes: pass 1 becomes the arena pass. The choice holds for SwitchFrames frames, then moves.
+    uint64_t frame = 3;
+    for (uint32_t i = 0; i < MissDarkeningPass::SwitchFrames; i++, frame++) {
+        passes.darkenThisPass(frame, 0, 5);
+        passes.darkenThisPass(frame, 1, 60);
+    }
+
+    CHECK(!passes.darkenThisPass(frame, 0, 5));
+    CHECK(passes.darkenThisPass(frame, 1, 60));
+}
+
+TEST_CASE("outside darkness: when the chosen pass stops running, the busiest pass takes over next frame") {
+    MissDarkeningPass passes;
+    passes.darkenThisPass(1, 2, 80);
+    CHECK(passes.darkenThisPass(2, 2, 80));
+    passes.darkenThisPass(3, 0, 30);
+    CHECK(passes.darkenThisPass(4, 0, 30));
+}
+
+TEST_CASE("venues: a new venue from the scene uses its largest textures no venue lists") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    const std::vector<std::pair<uint64_t, uint32_t>> stable = {
+        { 0x1ull, 40 }, { 0xB1E01BE92A6F5BE1ull, 500 }, { 0x2ull, 300 }, { 0x3ull, 120 }, { 0xAAull, 900 }
+    };
+
+    const std::vector<uint64_t> match = newVenueMatch(stable, file.venues, 2);
+    CHECK_EQ(match.size(), size_t(2));
+    CHECK_EQ(match[0], 0x2ull);
+    CHECK_EQ(match[1], 0x3ull);
+}
+
+TEST_CASE("outside darkness: a present carrying both swap targets' frames keeps each target's arena pass (background flickered)") {
+    // Raw's pattern: each frame is 94, 17, 9, 130, 2 meshes, on targets A and B in turn. Usually one frame per
+    // present, but sometimes a present carries two frames (the second target's passes are then its 6th..10th).
+    MissDarkening darkening;
+    const int targets[2] = { 0, 0 };
+    const size_t frame[] = { 94, 17, 9, 130, 2 };
+    uint32_t gameFrame = 0;
+    uint32_t framesWithoutDarkening = 0;
+    for (uint64_t present = 0; present < 200; present++) {
+        const int frames = ((present % 7) == 3) ? 2 : 1;
+        for (int f = 0; f < frames; f++, gameFrame++) {
+            uint32_t darkened = 0;
+            for (size_t meshes : frame) {
+                darkened += darkening.darkenThisPass(&targets[gameFrame % 2], present, meshes) ? 1 : 0;
+            }
+
+            CHECK(darkened <= 1u);
+            if ((gameFrame > 4) && (darkened == 0)) {
+                framesWithoutDarkening++;
+            }
+        }
+    }
+
+    CHECK_EQ(framesWithoutDarkening, 0u);
+}
+
+TEST_CASE("outside darkness: generated and real frames of a present agree after a cut to a smaller arena pass (crowd flickered)") {
+    // 60 fps: each present draws a generated frame to the game framebuffers (two, in turn) and then the real frame to
+    // the slot targets (three, serial % 3), with the same passes. No Mercy's attract cuts from an arena pass of 180
+    // meshes to one of 140.
+    MissDarkening darkening;
+    const int framebuffers[2] = { 0, 0 };
+    const int slots[3] = { 0, 0, 0 };
+    const size_t wide[] = { 9, 8, 2, 180, 3 };
+    const size_t close[] = { 9, 4, 2, 140, 3 };
+    uint32_t disagreements = 0;
+    for (uint64_t present = 0; present < 120; present++) {
+        const size_t *frame = (present < 40) ? wide : close;
+        uint32_t generated = 0;
+        uint32_t real = 0;
+        for (size_t i = 0; i < 5; i++) {
+            generated += darkening.darkenThisPass(&framebuffers[present % 2], present, frame[i]) ? (1u << i) : 0u;
+        }
+
+        for (size_t i = 0; i < 5; i++) {
+            real += darkening.darkenThisPass(&slots[present % 3], present, frame[i]) ? (1u << i) : 0u;
+        }
+
+        // The first present has no recent maximum yet when its generated frame's first pass runs.
+        disagreements += ((present > 0) && (generated != real)) ? 1 : 0;
+    }
+
+    CHECK_EQ(disagreements, 0u);
+}
+
+// Colored light (rt-color): "color", "keyColor", "fillColor", [x, y, z, weight, r, g, b] lights and
+// [x, y, z, intensity, range, r, g, b] glows.
+
+static const char *ColorFile = R"json(
+{
+    "default": {
+        "color": [1, 0.9, 0.75],
+        "lights": [[0, 650, 0, 2], [-320, 600, -320, 1, 1, 0, 0]]
+    },
+    "venues": [
+        { "name": "Blue", "match": ["0000000000000001"], "color": [0.6, 0.7, 1] },
+        { "name": "Plain", "match": ["0000000000000002"] },
+        { "name": "Rig", "match": ["0000000000000003"], "lights": [], "keyColor": [1, 0.2, 0.2] },
+        { "name": "Glow", "match": ["0000000000000004"], "glows": [[0, 500, 2700, 1, 1400], [0, 300, 0, 0.5, 900, 0.2, 0.4, 1]] }
+    ]
+}
+)json";
+
+TEST_CASE("colored light: presets without colors stay white and write no colors") {
+    const LightPresetFile file = parseLightPresets(SampleFile);
+    CHECK(file.defaultPreset.color == WhiteLight);
+    CHECK(file.venues[0].keyColor == WhiteLight);
+    CHECK(presetLightColor(file.venues[2], 1) == WhiteLight);
+    CHECK(presetGlowColor(file.venues[0], 0) == WhiteLight);
+    const std::string text = writeLightPresets(file);
+    CHECK(text.find("olor") == std::string::npos);
+    // Explicit lights without a color are written as [x, y, z, weight], as before.
+    CHECK(parseLightPresets(text).defaultPreset.lightOwnColor == std::vector<uint8_t>({ 0, 0, 0 }));
+}
+
+TEST_CASE("colored light: a venue's color reaches its key and fill lights unless it sets them") {
+    const LightPresetFile file = parseLightPresets(ColorFile);
+    const LightColor warm = { 1.0f, 0.9f, 0.75f };
+    const LightColor blue = { 0.6f, 0.7f, 1.0f };
+    CHECK(file.defaultPreset.keyColor == warm);
+    CHECK(file.venues[0].color == blue);
+    CHECK(file.venues[0].keyColor == blue);
+    CHECK(file.venues[0].fillColor == blue);
+    CHECK(file.venues[1].color == warm);
+    CHECK(file.venues[1].keyColor == warm);
+    // Sets only its key color: the fills keep the inherited (warm) color.
+    CHECK(file.venues[2].keyColor == LightColor({ 1.0f, 0.2f, 0.2f }));
+    CHECK(file.venues[2].fillColor == warm);
+}
+
+TEST_CASE("colored light: explicit lights use their own color or follow the preset's, also when inherited") {
+    const LightPresetFile file = parseLightPresets(ColorFile);
+    const LightColor red = { 1.0f, 0.0f, 0.0f };
+    CHECK(presetLightColor(file.defaultPreset, 0) == LightColor({ 1.0f, 0.9f, 0.75f }));
+    CHECK(presetLightColor(file.defaultPreset, 1) == red);
+    // "Blue" inherits default's lights: the one without its own color takes Blue's color, the red one stays red.
+    CHECK(presetLightColor(file.venues[0], 0) == LightColor({ 0.6f, 0.7f, 1.0f }));
+    CHECK(presetLightColor(file.venues[0], 1) == red);
+    // Out of range (generated rig, room lights): the preset's color.
+    CHECK(presetLightColor(file.venues[0], 7) == file.venues[0].color);
+}
+
+TEST_CASE("colored light: glows are white unless they carry a color") {
+    const LightPresetFile file = parseLightPresets(ColorFile);
+    const LightPreset &g = file.venues[3];
+    CHECK_EQ(g.glows.size(), size_t(2));
+    CHECK(presetGlowColor(g, 0) == WhiteLight);
+    CHECK(presetGlowColor(g, 1) == LightColor({ 0.2f, 0.4f, 1.0f }));
+    CHECK(presetGlowColor(g, 5) == WhiteLight);
+}
+
+TEST_CASE("colored light: write then parse keeps every color, and only the colors a preset sets are written") {
+    const LightPresetFile file = parseLightPresets(ColorFile);
+    const std::string text = writeLightPresets(file);
+    const LightPresetFile again = parseLightPresets(text);
+    CHECK(samePreset(again.defaultPreset, file.defaultPreset));
+    CHECK_EQ(again.venues.size(), file.venues.size());
+    for (size_t i = 0; i < file.venues.size(); i++) {
+        CHECK(samePreset(again.venues[i], file.venues[i]));
+        CHECK_EQ(again.venues[i].setFields, file.venues[i].setFields);
+    }
+
+    // "Plain" inherits its colors, so its entry has none and a later edit to default's color still reaches it.
+    const size_t plain = text.find("\"Plain\"");
+    const size_t rig = text.find("\"Rig\"");
+    CHECK(text.substr(plain, rig - plain).find("olor") == std::string::npos);
+}
+
+TEST_CASE("colored light: editing default's color reaches the venues that don't set one (inheritDefault)") {
+    LightPresetFile file = parseLightPresets(ColorFile);
+    file.defaultPreset.color = { 0.5f, 1.0f, 0.5f };
+    inheritDefault(file);
+    CHECK(file.defaultPreset.keyColor == LightColor({ 0.5f, 1.0f, 0.5f }));
+    CHECK(file.venues[1].keyColor == LightColor({ 0.5f, 1.0f, 0.5f }));
+    CHECK(presetLightColor(file.venues[1], 0) == LightColor({ 0.5f, 1.0f, 0.5f }));
+    CHECK(file.venues[0].keyColor == LightColor({ 0.6f, 0.7f, 1.0f }));
+}
+
+TEST_CASE("colored light: adding lights and glows pads the color lists (no own color, white glow)") {
+    LightPreset p;
+    p.color = { 1.0f, 0.5f, 0.5f };
+    p.lights.push_back({ 0.0f, 600.0f, 0.0f, 1.0f });
+    p.glows.push_back({ 0.0f, 0.0f, 0.0f, 1.0f, 100.0f });
+    syncColorLists(p);
+    CHECK_EQ(p.lightOwnColor.size(), size_t(1));
+    CHECK_EQ(p.lightOwnColor[0], uint8_t(0));
+    CHECK(presetLightColor(p, 0) == p.color);
+    CHECK(presetGlowColor(p, 0) == WhiteLight);
+}
+
+// Lit areas: the entrance set keeps its own lighting under outside darkness.
+
+TEST_CASE("lit areas: no darkness inside a lit area, the ring rule elsewhere") {
+    const std::vector<std::array<float, 4>> areas = { { 0.0f, 2700.0f, 600.0f, 400.0f } };
+    // The entrance set (far from the ring, inside the lit area) keeps its brightness.
+    CHECK_NEAR(outsideDarknessAt(0.0f, 2700.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 1.0f, 1e-6f);
+    // Halfway through the lit area's edge: half way (smoothstep 0.5) into the darkness.
+    CHECK_NEAR(outsideDarknessAt(0.0f, 2700.0f - 800.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 1.0f - 0.55f * 0.5f, 1e-5f);
+    // The stands at the side: full darkness, as without lit areas.
+    CHECK_NEAR(outsideDarknessAt(1800.0f, 0.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.55f, areas), 0.45f, 1e-6f);
+}
+
+TEST_CASE("lit areas: without any, the darkness matches outsideDarknessFactor") {
+    for (float d = 0.0f; d < 2000.0f; d += 37.0f) {
+        CHECK_NEAR(outsideDarknessAt(d, 0.0f, 0.0f, 0.0f, 650.0f, 500.0f, 0.6f, {}), outsideDarknessFactor(d, 650.0f, 500.0f, 0.6f), 1e-6f);
+    }
+}
+
+TEST_CASE("lit areas: parse (at most two), inherit from default, and round-trip") {
+    const char *text = R"json({
+        "default": { "outsideDarkness": 0.55, "litAreas": [[0, 2700, 600, 400]] },
+        "venues": [
+            { "name": "A", "match": ["0000000000000001"] },
+            { "name": "B", "match": ["0000000000000002"], "litAreas": [[1, 2, 3, 4], [5, 6, 7, 8], [9, 9, 9, 9]] },
+            { "name": "C", "match": ["0000000000000003"], "litAreas": [] }
+        ]
+    })json";
+    const LightPresetFile file = parseLightPresets(text);
+    CHECK_EQ(file.venues[0].litAreas.size(), size_t(1));
+    CHECK_EQ(file.venues[1].litAreas.size(), MaxLitAreas);
+    CHECK(file.venues[2].litAreas.empty());
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    for (size_t i = 0; i < file.venues.size(); i++) {
+        CHECK(again.venues[i].litAreas == file.venues[i].litAreas);
+        CHECK_EQ(again.venues[i].setFields, file.venues[i].setFields);
+    }
+}
+
+// Flickering glows: a failing fluorescent tube.
+
+TEST_CASE("flicker: deterministic, within 0..1, mostly on, with dropouts") {
+    uint32_t on = 0, off = 0, total = 0;
+    for (double t = 0.0; t < 60.0; t += 0.01, total++) {
+        const float v = glowFlicker(t, 3);
+        CHECK(v >= 0.0f && v <= 1.0f);
+        CHECK_EQ(v, glowFlicker(t, 3));
+        on += (v == 1.0f) ? 1 : 0;
+        off += (v == 0.0f) ? 1 : 0;
+    }
+
+    // Mostly on (the owner's ask), blinking off occasionally within a minute.
+    CHECK(on > total * 9 / 10);
+    CHECK(off > 0u);
+}
+
+TEST_CASE("flicker: amount 0 is steady, tubes get their own rhythm") {
+    bool differ = false;
+    for (double t = 0.0; t < 30.0; t += 0.05) {
+        CHECK_EQ(glowFlickerScale(t, 5, 0.0f), 1.0f);
+        const float half = glowFlickerScale(t, 5, 0.5f);
+        CHECK(half >= 0.5f && half <= 1.0f);
+        differ = differ || (glowFlicker(t, 1) != glowFlicker(t, 2));
+    }
+
+    CHECK(differ);
+}
+
+TEST_CASE("flicker: parsed as a 9th glow value and written back (colors written too)") {
+    const char *text = R"json({
+        "venues": [ { "name": "Hall", "match": ["0000000000000001"],
+            "glows": [[0, 300, 0, 2, 480], [0, 300, 400, 2, 480, 1, 1, 1, 0.8]] } ]
+    })json";
+    const LightPresetFile file = parseLightPresets(text);
+    CHECK_EQ(presetGlowFlicker(file.venues[0], 0), 0.0f);
+    CHECK_NEAR(presetGlowFlicker(file.venues[0], 1), 0.8f, 1e-6f);
+    const LightPresetFile again = parseLightPresets(writeLightPresets(file));
+    CHECK(again.venues[0].glowFlicker == file.venues[0].glowFlicker);
+    CHECK(again.venues[0].glowColors == file.venues[0].glowColors);
+}
+
+TEST_CASE("outside darkness: at 60 fps (interleaved targets, presents cutting through frames) every frame darkens once, on the arena pass (crowd flickered)") {
+    // Raw at 60 fps (from the WCW_RT_DARKNESS_LOG): each game frame is 94, 9, 9, 136, 2 meshes, drawn to two targets
+    // (real and interpolated) with their passes interleaved, and presents begin part way through frames, so a target's
+    // 94-mesh pass can be in one present and its arena pass in the next.
+    MissDarkening darkening;
+    const int targets[4] = { 0, 0, 0, 0 };
+    const size_t frame[] = { 94, 9, 9, 136, 2 };
+    uint32_t wrongPass = 0, undarkened = 0, doubled = 0;
+    uint64_t present = 0;
+    uint32_t passInPresent = 0;
+    const uint32_t presentLengths[] = { 7, 10, 6, 9, 11, 8 };
+    uint32_t lengthIndex = 0;
+    for (uint32_t gameFrame = 0; gameFrame < 120; gameFrame++) {
+        const void *pair[2] = { &targets[(gameFrame * 2) % 4], &targets[(gameFrame * 2 + 1) % 4] };
+        uint32_t dark[2] = { 0, 0 };
+        for (size_t meshes : frame) {
+            for (int k = 0; k < 2; k++) {
+                const bool d = darkening.darkenThisPass(pair[k], present, meshes);
+                dark[k] += d ? 1 : 0;
+                wrongPass += ((gameFrame > 1) && d && (meshes != 136)) ? 1 : 0;
+                if (++passInPresent >= presentLengths[lengthIndex]) {
+                    passInPresent = 0;
+                    lengthIndex = (lengthIndex + 1) % 6;
+                    present++;
+                }
+            }
+        }
+
+        if (gameFrame > 1) {
+            for (int k = 0; k < 2; k++) {
+                undarkened += (dark[k] == 0) ? 1 : 0;
+                doubled += (dark[k] > 1) ? 1 : 0;
+            }
+        }
+    }
+
+    CHECK_EQ(undarkened, 0u);
+    CHECK_EQ(doubled, 0u);
+    CHECK_EQ(wrongPass, 0u);
+}
+
+TEST_CASE("outside darkness: a scene change to smaller passes still darkens (the recent maximum decays)") {
+    MissDarkening darkening;
+    const int target = 0;
+    uint64_t present = 0;
+    for (int i = 0; i < 10; i++, present++) {
+        darkening.darkenThisPass(&target, present, 130);
+    }
+
+    // A backstage room: its biggest pass is 40 meshes. It may take a while, but it must darken again.
+    bool darkenedAgain = false;
+    for (int i = 0; i < 200; i++, present++) {
+        darkenedAgain = darkening.darkenThisPass(&target, present, 40);
+    }
+
+    CHECK(darkenedAgain);
+}
+
+// Venue switching (VenueSelector): two venues with their own textures plus a ring texture both list, fed one game frame
+// at a time.
+namespace {
+    const uint64_t Ring = 0x99;
+    const std::vector<uint64_t> ArenaA = { 0xA1, 0xA2, 0xA3, 0xA4, Ring };
+    const std::vector<uint64_t> ArenaB = { 0xB1, 0xB2, 0xB3, 0xB4, Ring };
+
+    std::vector<LightPreset> twoVenues() {
+        std::vector<LightPreset> venues(2);
+        venues[0].name = "A";
+        venues[0].match = ArenaA;
+        venues[1].name = "B";
+        venues[1].match = ArenaB;
+        computeUniqueMatches(venues);
+        return venues;
+    }
+
+    // Feeds frames of one scene for a number of seconds at a game rate; returns the time after the last frame.
+    double feed(VenueSelector &selector, const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures,
+        double start, double seconds, double rate)
+    {
+        double t = start;
+        for (int i = 0; i < int(seconds * rate + 0.5); i++) {
+            selector.update(venues, textures, t);
+            t += 1.0 / rate;
+        }
+
+        return t;
+    }
+
+    // Seconds from start until the active venue becomes want (feeding textures), or -1 within the limit.
+    double timeUntil(VenueSelector &selector, const std::vector<LightPreset> &venues, const std::vector<uint64_t> &textures,
+        int want, double start, double rate, double limit = 10.0)
+    {
+        for (double t = start; t < start + limit; t += 1.0 / rate) {
+            selector.update(venues, textures, t);
+            if (selector.active() == want) {
+                return t - start + 1.0 / rate;
+            }
+        }
+
+        return -1.0;
+    }
+}
+
+TEST_CASE("venue switching: a camera cut to another venue switches after two frames, not when the old shot ages out") {
+    const std::vector<LightPreset> venues = twoVenues();
+    // Both directions: from the earlier venue in the file to the later one, and back.
+    for (int from = 0; from < 2; from++) {
+        const int to = 1 - from;
+        VenueSelector selector;
+        const double t = feed(selector, venues, from ? ArenaB : ArenaA, 0.0, 3.0, 30.0);
+        CHECK_EQ(selector.active(), from);
+        CHECK_NEAR(timeUntil(selector, venues, to ? ArenaB : ArenaA, to, t, 30.0), 2.0 / 30.0, 1e-6);
+    }
+
+    // Before cuts were detected the old shot kept its full score for the whole window, so a cut to a venue earlier in
+    // the file (ties go to the later one) came over two seconds late. (To a later venue it took the hold, 0.33 s.)
+    VenueSelector windowOnly;
+    windowOnly.cutsEnabled = false;
+    const double t2 = feed(windowOnly, venues, ArenaB, 0.0, 3.0, 30.0);
+    CHECK(timeUntil(windowOnly, venues, ArenaA, 0, t2, 30.0) > VenueSelector::WindowSeconds);
+}
+
+TEST_CASE("venue switching: the cut reports itself, and the old shot can't switch back once the hold runs out") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    CHECK(selector.update(venues, ArenaB, t) == VenueSelector::Change::None);
+    CHECK(selector.update(venues, ArenaB, t + 1.0 / 30.0) == VenueSelector::Change::Cut);
+    t += 2.0 / 30.0;
+    bool stayed = true;
+    for (int i = 0; i < 120; i++, t += 1.0 / 30.0) {
+        stayed = stayed && (selector.update(venues, ArenaB, t) == VenueSelector::Change::None) && (selector.active() == 1);
+    }
+
+    CHECK(stayed);
+}
+
+TEST_CASE("venue switching: a close-up showing only the shared ring texture keeps the venue") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    t = feed(selector, venues, { Ring }, t, 1.5, 30.0);
+    CHECK_EQ(selector.active(), 0);
+    // Half of the venue's own textures: still the same venue.
+    t = feed(selector, venues, { 0xA1, 0xA2, Ring }, t, 3.0, 30.0);
+    CHECK_EQ(selector.active(), 0);
+}
+
+TEST_CASE("venue switching: a cut to an unmatched scene with few textures waits for the window and the lose time, at the same time at any game rate") {
+    const std::vector<LightPreset> venues = twoVenues();
+    // Fewer new textures than NewSceneMin: too little to call it a new scene (a close-up looks the same).
+    const std::vector<uint64_t> unmatched = { 0xC1, 0xC2 };
+    double delays[2];
+    const double rates[2] = { 30.0, 60.0 };
+    for (int r = 0; r < 2; r++) {
+        VenueSelector selector;
+        const double t = feed(selector, venues, ArenaA, 0.0, 3.0, rates[r]);
+        delays[r] = timeUntil(selector, venues, unmatched, -1, t, rates[r], 15.0);
+        CHECK(delays[r] >= VenueSelector::WindowSeconds + VenueSelector::LoseSeconds);
+        CHECK(delays[r] <= VenueSelector::WindowSeconds + VenueSelector::LoseSeconds + 2.0 / rates[r]);
+    }
+
+    CHECK_NEAR(delays[0], delays[1], 2.0 / 30.0);
+}
+
+TEST_CASE("venue switching: frames without world textures neither make nor break a cut") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    t = feed(selector, venues, {}, t, 0.5, 30.0);
+    CHECK_EQ(selector.active(), 0);
+    selector.update(venues, ArenaB, t);
+    selector.update(venues, {}, t + 1.0 / 30.0);
+    CHECK_EQ(selector.active(), 0);
+    selector.update(venues, ArenaB, t + 2.0 / 30.0);
+    CHECK_EQ(selector.active(), 1);
+}
+
+TEST_CASE("venue switching: from no venue, a matched scene takes over after two frames") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, { 0xC1 }, 0.0, 1.0, 30.0);
+    CHECK_EQ(selector.active(), -1);
+    CHECK_NEAR(timeUntil(selector, venues, ArenaA, 0, t, 30.0), 2.0 / 30.0, 1e-6);
+}
+
+namespace {
+    // A wide shot of venue A: its own textures, the ring, and floor/barrier textures no venue lists.
+    std::vector<uint64_t> wideShotA() {
+        std::vector<uint64_t> t = ArenaA;
+        for (uint64_t h = 0xF1; h <= 0xF6; h++) {
+            t.push_back(h);
+        }
+
+        return t;
+    }
+}
+
+TEST_CASE("venue switching: a cut to a new unmatched scene goes back to no venue after two frames") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    const double t = feed(selector, venues, wideShotA(), 0.0, 3.0, 30.0);
+    CHECK_EQ(selector.active(), 0);
+    std::vector<uint64_t> elsewhere;
+    for (uint64_t h = 0xD0; h < 0xD0 + VenueSelector::NewSceneMin; h++) {
+        elsewhere.push_back(h);
+    }
+
+    CHECK_NEAR(timeUntil(selector, venues, elsewhere, -1, t, 30.0), 2.0 / 30.0, 1e-6);
+
+    VenueSelector windowOnly;
+    windowOnly.cutsEnabled = false;
+    const double t2 = feed(windowOnly, venues, wideShotA(), 0.0, 3.0, 30.0);
+    CHECK(timeUntil(windowOnly, venues, elsewhere, -1, t2, 30.0) > VenueSelector::WindowSeconds);
+}
+
+TEST_CASE("venue switching: a camera swing that hides the venue's textures but keeps the ring and floor keeps the venue") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, wideShotA(), 0.0, 3.0, 30.0);
+    // The other side of the arena: eight textures not drawn before, plus the ring and floor from the wide shot.
+    std::vector<uint64_t> swing = { Ring };
+    for (uint64_t h = 0xF1; h <= 0xF6; h++) {
+        swing.push_back(h);
+    }
+
+    for (uint64_t h = 0xE0; h < 0xE8; h++) {
+        swing.push_back(h);
+    }
+
+    t = feed(selector, venues, swing, t, 1.0, 30.0);
+    CHECK_EQ(selector.active(), 0);
+}
+
+TEST_CASE("venue switching: a long 2D screen lets the venue go once, without stale frames cutting back to it") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    CHECK_EQ(selector.active(), 0);
+    int switches = 0;
+    for (int i = 0; i < 30 * 10; i++, t += 1.0 / 30.0) {
+        switches += (selector.update(venues, {}, t) != VenueSelector::Change::None) ? 1 : 0;
+    }
+
+    CHECK_EQ(selector.active(), -1);
+    CHECK_EQ(switches, 1);
+}
+
+// aki-roadmap#244, the venue half: in a match, close-ups (a hold, a pin) draw a few floor textures and none of the
+// venue's own. Each one longer than the window plus the hold (2.3 s) dropped the rig to default, and the next wide shot
+// cut straight back: two switches per close-up, the lights going off and on.
+namespace {
+    const std::vector<uint64_t> CloseUp = { 0xF1, 0xF2, 0xF3 };
+
+    int closeUpSwitches(VenueSelector &selector, const std::vector<LightPreset> &venues, double rate) {
+        double t = feed(selector, venues, ArenaA, 0.0, 3.0, rate);
+        int switches = 0;
+        for (int round = 0; round < 10; round++) {
+            for (int i = 0; i < int(3.0 * rate); i++, t += 1.0 / rate) {
+                switches += (selector.update(venues, CloseUp, t) != VenueSelector::Change::None) ? 1 : 0;
+            }
+
+            for (int i = 0; i < int(1.0 * rate); i++, t += 1.0 / rate) {
+                switches += (selector.update(venues, ArenaA, t) != VenueSelector::Change::None) ? 1 : 0;
+            }
+        }
+
+        return switches;
+    }
+}
+
+TEST_CASE("venue switching: 3 s close-ups between wide shots keep an established venue (no off/on flip-flop)") {
+    const std::vector<LightPreset> venues = twoVenues();
+    for (double rate : { 30.0, 60.0 }) {
+        VenueSelector selector;
+        CHECK_EQ(closeUpSwitches(selector, venues, rate), 0);
+        CHECK_EQ(selector.active(), 0);
+    }
+}
+
+TEST_CASE("venue switching: an established venue still goes after a long absence, once") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    int switches = 0;
+    for (int i = 0; i < 30 * 12; i++, t += 1.0 / 30.0) {
+        switches += (selector.update(venues, CloseUp, t) != VenueSelector::Change::None) ? 1 : 0;
+    }
+
+    CHECK_EQ(selector.active(), -1);
+    CHECK_EQ(switches, 1);
+}
+
+TEST_CASE("venue switching: real cuts still switch at once from an established venue") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, wideShotA(), 0.0, 3.0, 30.0);
+    // Another venue.
+    CHECK_NEAR(timeUntil(selector, venues, ArenaB, 1, t, 30.0), 2.0 / 30.0, 1e-6);
+    t = feed(selector, venues, ArenaB, t + 2.0 / 30.0, 3.0, 30.0);
+    // A new unmatched scene.
+    std::vector<uint64_t> elsewhere;
+    for (uint64_t h = 0xD0; h < 0xD0 + VenueSelector::NewSceneMin; h++) {
+        elsewhere.push_back(h);
+    }
+
+    CHECK_NEAR(timeUntil(selector, venues, elsewhere, -1, t, 30.0), 2.0 / 30.0, 1e-6);
+}
+
+TEST_CASE("venue switching: a two-frame false match is never established and goes after the hold") {
+    // BTBW's attract: an unmatched arena showed the Boiler room's textures on two frames now and then.
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, CloseUp, 0.0, 1.0, 30.0);
+    selector.update(venues, ArenaB, t);
+    selector.update(venues, ArenaB, t + 1.0 / 30.0);
+    CHECK_EQ(selector.active(), 1);
+    const double delay = timeUntil(selector, venues, CloseUp, -1, t + 2.0 / 30.0, 30.0);
+    CHECK(delay >= VenueSelector::WindowSeconds - 2.0 / 30.0);
+    CHECK(delay <= VenueSelector::WindowSeconds + VenueSelector::HoldSeconds + 2.0 / 30.0);
+}
+
+TEST_CASE("venue switching: a venue reached through the window doesn't inherit the previous venue's established state") {
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    selector.cutsEnabled = false;
+    double t = feed(selector, venues, ArenaA, 0.0, 4.0, 30.0);
+    CHECK_EQ(selector.active(), 0);
+    // B takes over through the window (no cuts), then a close-up right away: B isn't established, so it goes after
+    // the hold, not the lose time.
+    t = feed(selector, venues, ArenaB, t, 1.0, 30.0);
+    CHECK_EQ(selector.active(), 1);
+    const double delay = timeUntil(selector, venues, CloseUp, -1, t, 30.0);
+    CHECK(delay > 0.0);
+    CHECK(delay <= VenueSelector::WindowSeconds + VenueSelector::HoldSeconds + 2.0 / 30.0);
+}
+
+// aki-roadmap#244: an unmatched arena whose camera alternates close-ups (small bounds) and wide shots (large bounds)
+// every second. Per frame, the room rig flipped on every close-up; through the gate it never turns on.
+TEST_CASE("room gate: close-ups in an unmatched arena don't turn the room rig on and off") {
+    RoomGate gate;
+    int flips = 0;
+    bool last = false;
+    double t = 0.0;
+    for (int i = 0; i < 30 * 40; i++, t += 1.0 / 30.0) {
+        const bool closeUp = (int(t) % 2) == 0;
+        const bool on = gate.update(true, true, closeUp ? 1200.0f : 6000.0f, 3000.0f, t);
+        flips += (on != last) ? 1 : 0;
+        last = on;
+    }
+
+    CHECK_EQ(flips, 0);
+    CHECK(!gate.active());
+}
+
+TEST_CASE("room gate: a small room turns it on after OnSeconds, and a wide scene turns it off after OffSeconds") {
+    RoomGate gate;
+    double t = 0.0;
+    for (; t < RoomGate::OnSeconds - 0.1; t += 1.0 / 30.0) {
+        CHECK(!gate.update(true, true, 2500.0f, 3000.0f, t));
+    }
+
+    for (; t < RoomGate::OnSeconds + 0.2; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    // One wide frame (a fade, a cut out and back) and the band between maxExtent and the margin don't drop it.
+    CHECK(gate.update(true, true, 9000.0f, 3000.0f, t));
+    t += 1.0 / 30.0;
+    for (double end = t + 2.0; t < end; t += 1.0 / 30.0) {
+        CHECK(gate.update(true, true, 3500.0f, 3000.0f, t));
+    }
+
+    // No bounds (a 2D screen) keeps the state.
+    CHECK(gate.update(true, false, 0.0f, 3000.0f, t));
+    const double wideFrom = t;
+    while (gate.update(true, true, 9000.0f, 3000.0f, t)) {
+        t += 1.0 / 30.0;
+    }
+
+    CHECK(t - wideFrom >= RoomGate::OffSeconds - 1e-6);
+    CHECK(t - wideFrom < RoomGate::OffSeconds + 0.1);
+}
+
+TEST_CASE("room gate: a cut frame during the wait doesn't restart it") {
+    RoomGate gate;
+    double t = 0.0;
+    bool sawSpike = false;
+    for (int i = 0; t < RoomGate::OnSeconds + 0.1; i++, t += 1.0 / 30.0) {
+        // One wide frame early in the wait (a cut frame).
+        const bool spike = (i == 5);
+        sawSpike = sawSpike || spike;
+        gate.update(true, true, spike ? 8000.0f : 1200.0f, 3000.0f, t);
+    }
+
+    CHECK(sawSpike);
+    CHECK(gate.active());
+}
+
+TEST_CASE("room gate: presents without 3D keep the state, and a gap between updates restarts the wait") {
+    RoomGate gate;
+    double t = 0.0;
+    // A long 2D screen after a close-up doesn't turn the room rig on.
+    gate.update(true, true, 1200.0f, 3000.0f, t);
+    for (t += 1.0 / 30.0; t < 5.0; t += 1.0 / 30.0) {
+        CHECK(!gate.update(true, false, 1200.0f, 3000.0f, t));
+    }
+
+    // Two small samples 2 s apart (RT was off, or a load) don't count as a room that stayed small.
+    gate.reset();
+    CHECK(!gate.update(true, true, 1200.0f, 3000.0f, 10.0));
+    CHECK(!gate.update(true, true, 1200.0f, 3000.0f, 12.0));
+}
+
+TEST_CASE("room gate: a matched venue during the wait starts it over") {
+    RoomGate gate;
+    double t = 0.0;
+    for (; t < RoomGate::OnSeconds * 0.8; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(!gate.update(false, true, 2500.0f, 3000.0f, t));
+    const double from = t + 1.0 / 30.0;
+    for (t = from; t < from + RoomGate::OnSeconds - 0.1; t += 1.0 / 30.0) {
+        CHECK(!gate.update(true, true, 2500.0f, 3000.0f, t));
+    }
+}
+
+TEST_CASE("room gate: a matched venue or a disabled room turns it off at once") {
+    RoomGate gate;
+    double t = 0.0;
+    for (; t < RoomGate::OnSeconds + 0.5; t += 1.0 / 30.0) {
+        gate.update(true, true, 1000.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    CHECK(!gate.update(false, true, 1000.0f, 3000.0f, t));
+    // Blocked for longer than BriefSeconds, it needs the full OnSeconds again afterwards.
+    for (const double end = t + RoomGate::BriefSeconds + 0.5; t < end; t += 1.0 / 30.0) {
+        CHECK(!gate.update(false, true, 1000.0f, 3000.0f, t));
+    }
+
+    const double from = t;
+    for (; t < from + RoomGate::OnSeconds - 0.1; t += 1.0 / 30.0) {
+        CHECK(!gate.update(true, true, 1000.0f, 3000.0f, t));
+    }
+}
+
+// aki-roadmap#244 follow-up: BTBW's entrance (no venue matches, the room rig on) briefly matched the Boiler room and
+// the Locker room through cut hits, ~1.2 s each. The room rig went room -> venue -> default for OnSeconds -> room
+// (two extra rig switches per hit); it comes back at once now.
+TEST_CASE("room gate: a brief venue cut hit goes straight back to the room rig") {
+    RoomGate gate;
+    double t = 0.0;
+    for (; t < RoomGate::OnSeconds + 0.5; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    int switches = 0;
+    bool last = true;
+    for (int hit = 0; hit < 2; hit++) {
+        for (const double end = t + 1.2; t < end; t += 1.0 / 30.0) {
+            const bool on = gate.update(false, true, 2500.0f, 3000.0f, t);
+            switches += (on != last) ? 1 : 0;
+            last = on;
+        }
+
+        // The first present after the hit is the room rig again.
+        const bool back = gate.update(true, true, 2500.0f, 3000.0f, t);
+        CHECK(back);
+        switches += (back != last) ? 1 : 0;
+        last = back;
+        t += 1.0 / 30.0;
+        for (const double end = t + 5.0; t < end; t += 1.0 / 30.0) {
+            const bool on = gate.update(true, true, 2500.0f, 3000.0f, t);
+            switches += (on != last) ? 1 : 0;
+            last = on;
+        }
+    }
+
+    CHECK(gate.active());
+    CHECK_EQ(switches, 4);  // off and back on for each hit, nothing in between
+    // Back to a wide scene after the hit: it still turns off after OffSeconds.
+    const double wideFrom = t;
+    while (gate.update(true, true, 9000.0f, 3000.0f, t)) {
+        t += 1.0 / 30.0;
+    }
+
+    CHECK(t - wideFrom < RoomGate::OffSeconds + 0.1);
+    // A gap in the updates (RT off, a load) during the block forgets the room.
+    for (; t < wideFrom + 10.0; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    CHECK(!gate.update(false, true, 2500.0f, 3000.0f, t));
+    t += 1.0;
+    CHECK(!gate.update(true, true, 2500.0f, 3000.0f, t));
+}
+
+TEST_CASE("room gate: no resume after a brief hit when the next scene is wide, or after reset") {
+    RoomGate gate;
+    double t = 0.0;
+    for (; t < RoomGate::OnSeconds + 0.5; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    for (const double end = t + 1.0; t < end; t += 1.0 / 30.0) {
+        gate.update(false, true, 2500.0f, 3000.0f, t);
+    }
+
+    // A wide first present after the hit stays on the default rig.
+    CHECK(!gate.update(true, true, 9000.0f, 3000.0f, t));
+    t += 1.0 / 30.0;
+    CHECK(!gate.update(true, true, 2500.0f, 3000.0f, t));
+    // Room on again, blocked, then reset (a preset reload): no resume.
+    for (const double end = t + RoomGate::OnSeconds + 0.5; t < end; t += 1.0 / 30.0) {
+        gate.update(true, true, 2500.0f, 3000.0f, t);
+    }
+
+    CHECK(gate.active());
+    gate.update(false, true, 2500.0f, 3000.0f, t);
+    gate.reset();
+    t += 1.0 / 30.0;
+    CHECK(!gate.update(true, true, 2500.0f, 3000.0f, t));
+}
+
+TEST_CASE("venue switching: a frame from before a 2D screen doesn't pair with the next scene's first frame") {
+    // World Tour: the DOA arena also draws every WCW texture, and the menu before it draws only WCW's. A menu frame
+    // left over from before the VS screen plus the arena's first frame pointed to WCW; the arena is DOA (the later venue
+    // wins the tie when both are fully shown).
+    const std::vector<LightPreset> venues = twoVenues();
+    VenueSelector selector;
+    double t = feed(selector, venues, ArenaA, 0.0, 3.0, 30.0);
+    t = feed(selector, venues, {}, t, VenueSelector::WindowSeconds + VenueSelector::LoseSeconds + 1.0, 30.0);
+    CHECK_EQ(selector.active(), -1);
+    std::vector<uint64_t> both = ArenaA;
+    both.insert(both.end(), ArenaB.begin(), ArenaB.end());
+    bool everA = false;
+    for (int i = 0; i < 30; i++, t += 1.0 / 30.0) {
+        selector.update(venues, both, t);
+        everA = everA || (selector.active() == 0);
+    }
+
+    CHECK(!everA);
+    CHECK_EQ(selector.active(), 1);
+}

@@ -1,0 +1,660 @@
+//
+// RT64
+//
+
+// [wcw rt] Hybrid ray tracing pass (D3D12 only, inline ray queries, cs_6_5).
+// Casts a primary ray from the game camera through every pixel of the traced projection's
+// viewport against the frame's world-space geometry, then either visualizes the hit
+// (debug modes) or traces a shadow ray toward the scene light (shadow mode).
+
+#include "shared/rt64_wcw_rt.h"
+#include "shared/rt64_f3d_defines.h"
+#include "shared/rt64_gpu_tile.h"
+#include "shared/rt64_rdp_tile.h"
+
+ConstantBuffer<WcwRtParams> gParams : register(b0);
+RaytracingAccelerationStructure gScene : register(t1);
+StructuredBuffer<float4> gWorldPos : register(t2);
+StructuredBuffer<uint> gFaceIndices : register(t3);
+StructuredBuffer<uint> gMeshIndexStarts : register(t4);
+RWTexture2D<float4> gOutput : register(u5);
+// Shadow mode: (shadow factor RGB, AO factor) for the resolve pass, which filters the shadow and AO terms separately.
+// The shadow factor is colored by the lights and includes the glows (up to 2).
+RWTexture2D<float4> gCurrent : register(u6);
+// Shadow mode: the primary hit distance (0 = no hit), beside gCurrent.
+RWTexture2D<float> gCurrentDist : register(u13);
+StructuredBuffer<RDPTile> gRDPTiles : register(t7);
+StructuredBuffer<GPUTile> gGPUTiles : register(t8);
+StructuredBuffer<float2> gTexCoords : register(t9);
+StructuredBuffer<uint> gMeshTiles : register(t10);
+// World-space vertex normals (zero for vertices without one); only meaningful on lit meshes (WCW_RT_MESH_LIT).
+StructuredBuffer<float4> gWorldNorm : register(t11);
+// Blue noise tile, WCW_RT_BLUE_NOISE_SIZE squared values in [0, 1), row-major.
+StructuredBuffer<float> gBlueNoise : register(t12);
+// The framebuffer renderer's bindless RGBA texture cache.
+Texture2D<float4> gTextures[8192] : register(t0, space1);
+
+int moduloInt(int a, int b) {
+    return (b > 0) ? (a - b * int(floor(float(a) / float(b)))) : a;
+}
+
+// Texel alpha of an alpha-tested draw at a hit, point sampled with the same tile transform
+// and clamp/wrap/mirror rules as TextureSampler.hlsli. Tiles needing raw TMEM decoding are
+// treated as opaque.
+float hitAlpha(uint geometryIndex, uint primitiveIndex, float2 barycentrics) {
+    const uint tileWord = gMeshTiles[geometryIndex];
+    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
+    const float2 uv0 = gTexCoords[gFaceIndices[base + 0]];
+    const float2 uv1 = gTexCoords[gFaceIndices[base + 1]];
+    const float2 uv2 = gTexCoords[gFaceIndices[base + 2]];
+    const float2 inputUV = uv0 * (1.0f - barycentrics.x - barycentrics.y) + uv1 * barycentrics.x + uv2 * barycentrics.y;
+
+    const uint tileIndex = tileWord & WCW_RT_TILE_INDEX_MASK;
+    const RDPTile rdpTile = gRDPTiles[tileIndex];
+    const GPUTile gpuTile = gGPUTiles[tileIndex];
+    if (gpuTileFlagRawTMEM(gpuTile.flags)) {
+        return 1.0f;
+    }
+
+    const float correction = ((tileWord & WCW_RT_TILE_UV_CORRECTION) != 0) ? 0.5f : 1.0f;
+    float2 uvCoord = inputUV * correction * float2(rdpTile.shifts, rdpTile.shiftt);
+    if (gpuTileFlagShiftedByHalf(gpuTile.flags)) {
+        uvCoord += float2(0.5f, 0.5f);
+    }
+
+    uvCoord *= gpuTile.tcScale;
+    uvCoord -= (float2(rdpTile.uls, rdpTile.ult) * gpuTile.ulScale) / 4.0f;
+    int2 texel = int2(floor(uvCoord));
+    const float2 tcScale = gpuTile.tcScale;
+    if (rdpTile.cms & G_TX_CLAMP) {
+        texel.x = clamp(texel.x, 0, int(round(tcScale.x * rdpTile.lrs) / 4 - round(tcScale.x * rdpTile.uls) / 4 + round(tcScale.x - 1.0f)));
+    }
+
+    if (rdpTile.cmt & G_TX_CLAMP) {
+        texel.y = clamp(texel.y, 0, int(round(tcScale.y * rdpTile.lrt) / 4 - round(tcScale.y * rdpTile.ult) / 4 + round(tcScale.y - 1.0f)));
+    }
+
+    const int masks = int(round(rdpTile.masks * tcScale.x));
+    if ((rdpTile.cms & G_TX_MIRROR) && (masks > 0) && (moduloInt(texel.x, masks * 2) >= masks)) {
+        texel.x = (masks - 1) - moduloInt(texel.x, masks);
+    }
+    else {
+        texel.x = moduloInt(texel.x, masks);
+    }
+
+    const int maskt = int(round(rdpTile.maskt * tcScale.y));
+    if ((rdpTile.cmt & G_TX_MIRROR) && (maskt > 0) && (moduloInt(texel.y, maskt * 2) >= maskt)) {
+        texel.y = (maskt - 1) - moduloInt(texel.y, maskt);
+    }
+    else {
+        texel.y = moduloInt(texel.y, maskt);
+    }
+
+    const int2 size = int2(gpuTile.textureDimensions.xy);
+    texel = clamp(texel, int2(0, 0), max(size - 1, int2(0, 0)));
+    return gTextures[NonUniformResourceIndex(gpuTile.textureIndex)].Load(int3(texel, 0)).a;
+}
+
+// Non-opaque candidates of this workload's alpha-tested draws only count where the texel is
+// solid; other workloads' geometry (instance ID > 0) has no bound texture data here.
+bool candidateIsSolid(uint instanceId, uint geometryIndex, uint primitiveIndex, float2 barycentrics) {
+    if ((instanceId != 0) || ((gMeshTiles[geometryIndex] & WCW_RT_TILE_ALPHA_TEST) == 0)) {
+        return true;
+    }
+
+    return hitAlpha(geometryIndex, primitiveIndex, barycentrics) >= 0.5f;
+}
+
+// Interleaved gradient noise, decorrelated per frame and per use.
+float noise(uint2 pixel, uint seed) {
+    const float2 p = float2(pixel) + float(seed) * 5.588238f;
+    return frac(52.9829189f * frac(0.06711056f * p.x + 0.00583715f * p.y));
+}
+
+// Random sample `dim` of a pixel this frame, in [0, 1). Blue noise: every dimension reads the tile at its own
+// toroidal offset (R2 sequence), so dimensions are uncorrelated, and each frame rotates all values by the golden
+// ratio, so the temporal resolve averages well-spread values. The old interleaved gradient noise stays available
+// (WCW_RT_NOISE=0, or the left half with WCW_RT_NOISE_SPLIT=1); igOffset decorrelates its uses.
+float sampleNoise(uint2 pixel, uint dim, uint2 igOffset) {
+    const bool oldNoise = (gParams.noiseMode == 0) || ((gParams.noiseSplit != 0) && (pixel.x < (gParams.resolution.x / 2)));
+    if (oldNoise) {
+        return noise(pixel + igOffset, gParams.frameIndex * 64 + dim);
+    }
+
+    const uint size = WCW_RT_BLUE_NOISE_SIZE;
+    const uint2 shift = uint2(frac(float(dim) * 0.7548776662f) * float(size), frac(float(dim) * 0.5698402910f) * float(size));
+    const uint2 p = (pixel + shift) & (size - 1);
+    return frac(gBlueNoise[p.y * size + p.x] + float(gParams.frameIndex & 1023u) * 0.6180339887f);
+}
+
+bool resolvedMode() {
+    return (gParams.mode == WCW_RT_MODE_SHADOW) || (gParams.mode == WCW_RT_MODE_AO);
+}
+
+// How much outside darkness applies at a distance from a lit region (WcwLogic::darknessRamp).
+float darknessRamp(float distance, float radius, float edge) {
+    if (distance <= radius) {
+        return 0.0f;
+    }
+
+    if (edge <= 0.0f) {
+        return 1.0f;
+    }
+
+    const float t = saturate((distance - radius) / edge);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Outside darkness of a world surface at a floor point (WcwLogic::outsideDarknessAt): the smallest darkness ramp of
+// the ring's and the lit areas' (the entrance set has its own lighting).
+float outsideFactorAt(float2 xz) {
+    if (gParams.outsideDarkness <= 0.0f) {
+        return 1.0f;
+    }
+
+    float ramp = darknessRamp(length(xz - gParams.lightPosition.xz), gParams.receiverRadius, gParams.outsideEdge);
+    if (gParams.litAreaCount > 0) {
+        ramp = min(ramp, darknessRamp(length(xz - float2(gParams.litArea0X, gParams.litArea0Z)), gParams.litArea0Radius, gParams.litArea0Edge));
+    }
+
+    if (gParams.litAreaCount > 1) {
+        ramp = min(ramp, darknessRamp(length(xz - float2(gParams.litArea1X, gParams.litArea1Z)), gParams.litArea1Radius, gParams.litArea1Edge));
+    }
+
+    return 1.0f - saturate(gParams.outsideDarkness) * ramp;
+}
+
+void writeNoHit(uint2 pixel, RayDesc ray) {
+    if (resolvedMode()) {
+        // Background (on the frame's arena pass only; see darkenMisses), judged where the ray lands on the arena
+        // floor (WcwLogic::missFloorDistance): the mat drawn by another pass stays lit, the stands darken.
+        float missFactor = 1.0f;
+        if ((gParams.darkenMisses != 0) && (gParams.outsideDarkness > 0.0f)) {
+            // Rays that point up or never reach the floor count as infinitely far: full darkness.
+            missFactor = 1.0f - saturate(gParams.outsideDarkness);
+            if (ray.Direction.y < -1e-4f) {
+                const float t = (gParams.missFloorY - ray.Origin.y) / ray.Direction.y;
+                if (t > 0.0f) {
+                    missFactor = outsideFactorAt(ray.Origin.xz + ray.Direction.xz * t);
+                }
+            }
+        }
+
+        gCurrent[pixel] = float4(missFactor, missFactor, missFactor, 1.0f);
+        gCurrentDist[pixel] = 0.0f;
+    }
+    else {
+        gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
+    }
+}
+
+// Unnormalized: the winding (v0, v1, v2) is kept, which back-face culling relies on.
+float3 triangleCross(uint geometryIndex, uint primitiveIndex) {
+    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
+    const float3 v0 = gWorldPos[gFaceIndices[base + 0]].xyz;
+    const float3 v1 = gWorldPos[gFaceIndices[base + 1]].xyz;
+    const float3 v2 = gWorldPos[gFaceIndices[base + 2]].xyz;
+    return cross(v1 - v0, v2 - v0);
+}
+
+float3 triangleNormal(uint geometryIndex, uint primitiveIndex) {
+    const uint base = (gMeshIndexStarts[geometryIndex] & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
+    const float3 v0 = gWorldPos[gFaceIndices[base + 0]].xyz;
+    const float3 v1 = gWorldPos[gFaceIndices[base + 1]].xyz;
+    const float3 v2 = gWorldPos[gFaceIndices[base + 2]].xyz;
+    const float3 n = cross(v1 - v0, v2 - v0);
+    const float len = length(n);
+    return (len > 1e-8f) ? (n / len) : float3(0.0f, 1.0f, 0.0f);
+}
+
+// The smooth normal at a hit on a lit draw: its vertex normals interpolated with the hit barycentrics, so low-poly
+// models (wrestlers) shade as the surface the normals describe instead of one value per facet. Other draws, and
+// degenerate normals, get the face normal. faceNormal faces the viewer; a smooth normal seen from behind is flipped
+// to match.
+float3 smoothNormal(uint geometryIndex, uint primitiveIndex, float2 barycentrics, float3 faceNormal) {
+    const uint meshStart = gMeshIndexStarts[geometryIndex];
+    if ((meshStart & WCW_RT_MESH_LIT) == 0) {
+        return faceNormal;
+    }
+
+    const uint base = (meshStart & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
+    const float3 n0 = gWorldNorm[gFaceIndices[base + 0]].xyz;
+    const float3 n1 = gWorldNorm[gFaceIndices[base + 1]].xyz;
+    const float3 n2 = gWorldNorm[gFaceIndices[base + 2]].xyz;
+    const float3 n = n0 * (1.0f - barycentrics.x - barycentrics.y) + n1 * barycentrics.x + n2 * barycentrics.y;
+    const float len = length(n);
+    if (len < 1e-3f) {
+        return faceNormal;
+    }
+
+    const float3 smoothN = n / len;
+    return (dot(smoothN, faceNormal) < 0.0f) ? -smoothN : smoothN;
+}
+
+// The AO hemisphere's normal: the smooth normal unless WCW_RT_AO_SMOOTH=0.
+float3 aoNormal(uint geometryIndex, uint primitiveIndex, float2 barycentrics, float3 faceNormal) {
+    return (gParams.aoSmoothNormals != 0) ? smoothNormal(geometryIndex, primitiveIndex, barycentrics, faceNormal) : faceNormal;
+}
+
+// Where shadow rays start on a lit draw: the hit point lifted onto the tangent plane of each vertex it lies below,
+// blended by the barycentrics (Hanika 2021, "Hacking the shadow terminator"). A flat triangle of a low-poly model
+// sits inside the smooth surface its normals describe, so near the terminator rays from the flat hit clip the
+// neighbouring facets and the shadow edge follows the facets. Flat parts of a mesh (all normals equal) don't move.
+float3 shadowOrigin(uint geometryIndex, uint primitiveIndex, float2 barycentrics, float3 hitPos, float3 faceNormal) {
+    const uint meshStart = gMeshIndexStarts[geometryIndex];
+    if ((meshStart & WCW_RT_MESH_LIT) == 0) {
+        return hitPos;
+    }
+
+    const uint base = (meshStart & ~WCW_RT_MESH_FLAGS) + primitiveIndex * 3;
+    const float3 weights = float3(1.0f - barycentrics.x - barycentrics.y, barycentrics.x, barycentrics.y);
+    float3 lifted = hitPos;
+    [unroll]
+    for (uint k = 0; k < 3; k++) {
+        const uint index = gFaceIndices[base + k];
+        float3 n = gWorldNorm[index].xyz;
+        const float len = length(n);
+        if (len < 1e-3f) {
+            continue;
+        }
+
+        n = (dot(n, faceNormal) < 0.0f) ? (-n / len) : (n / len);
+        const float below = min(dot(hitPos - gWorldPos[index].xyz, n), 0.0f);
+        lifted -= weights[k] * below * n;
+    }
+
+    return lifted;
+}
+
+// A light's or glow's color at this pixel: white on the left half with WCW_RT_COLOR_SPLIT.
+bool whiteLight(uint2 pixel) {
+    return (gParams.colorSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
+}
+
+// Brightening from the preset's glows at a hit point (0 = none), in each glow's color.
+float3 glowLight(float3 hitPos, float3 normal, uint2 pixel) {
+    float3 glow = float3(0.0f, 0.0f, 0.0f);
+    const uint count = min(gParams.glowCount, WCW_RT_MAX_GLOWS);
+    for (uint g = 0; g < count; g++) {
+        const float3 toGlow = gParams.glows[g].xyz - hitPos;
+        const float dist = length(toGlow);
+        const float range = gParams.glows[g].w;
+        const float facing = dot(normal, toGlow) / max(dist, 1e-3f);
+        if ((dist >= range) || (facing <= 0.0f)) {
+            continue;
+        }
+
+        const float t = dist / range;
+        const float atten = (1.0f - t * t) * (1.0f - t * t);
+        RayDesc glowRay;
+        glowRay.Origin = hitPos + normal * 0.5f;
+        glowRay.Direction = toGlow / dist;
+        glowRay.TMin = 0.5f;
+        glowRay.TMax = max(dist - gParams.lightClearance, 0.6f);
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+        q.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, glowRay);
+        while (q.Proceed()) {
+            if (candidateIsSolid(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics())) {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+
+        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+            const float3 color = whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.glowColors[g].rgb;
+            glow += color * (gParams.glowIntensity[g] * atten * facing);
+        }
+    }
+
+    return glow;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint2 dispatchPixel : SV_DispatchThreadID) {
+    const uint2 pixel = dispatchPixel + gParams.traceOffset;
+    if (any(pixel >= gParams.resolution)) {
+        return;
+    }
+
+    const float2 pixelCenter = (float2(pixel) + 0.5f) / gParams.traceScale;
+    const float2 local = (pixelCenter - gParams.viewport.xy) / gParams.viewport.zw;
+    if (any(local < 0.0f) || any(local > 1.0f)) {
+        // Outside the game's viewport: no ray; counts as far background.
+        RayDesc outsideRay;
+        outsideRay.Origin = float3(0.0f, 0.0f, 0.0f);
+        outsideRay.Direction = float3(0.0f, 1.0f, 0.0f);
+        outsideRay.TMin = 0.0f;
+        outsideRay.TMax = 0.0f;
+        writeNoHit(pixel, outsideRay);
+        return;
+    }
+
+    // Primary rays span the clip volume (N64 projections map near/far to NDC z -1/+1), so
+    // geometry the raster clips at the near plane (e.g. a wrestler right at the camera) is skipped.
+    const float2 ndc = float2(local.x * 2.0f - 1.0f, 1.0f - local.y * 2.0f);
+    const float4 nearPoint = mul(gParams.invViewProj, float4(ndc, -1.0f, 1.0f));
+    const float4 farPoint = mul(gParams.invViewProj, float4(ndc, 1.0f, 1.0f));
+    const float3 rayStart = nearPoint.xyz / nearPoint.w;
+    const float3 rayEnd = farPoint.xyz / farPoint.w;
+
+    RayDesc ray;
+    ray.Origin = rayStart;
+    ray.Direction = normalize(rayEnd - rayStart);
+    ray.TMin = 0.0f;
+    ray.TMax = length(rayEnd - rayStart);
+
+    // Culled draws are non-opaque: commit their candidates only when front-facing, matching
+    // the raster (N64 front faces wind counter-clockwise as seen from the camera).
+    // Primary rays only see this workload's geometry (instance mask 0x1); the other workloads'
+    // geometry (0x2) is drawn and shaded by their own passes but still casts shadows here.
+    RayQuery<RAY_FLAG_NONE> primary;
+    primary.TraceRayInline(gScene, RAY_FLAG_NONE, 0x1, ray);
+    while (primary.Proceed()) {
+        if (primary.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            const uint geometryIndex = primary.CandidateGeometryIndex();
+            const uint primitiveIndex = primary.CandidatePrimitiveIndex();
+            const bool culled = (gMeshIndexStarts[geometryIndex] & WCW_RT_MESH_CULLED) != 0;
+            const float3 n = triangleCross(geometryIndex, primitiveIndex);
+            const bool facing = !culled || ((dot(n, ray.Direction) * gParams.cullSign) < 0.0f);
+            if (facing && candidateIsSolid(primary.CandidateInstanceID(), geometryIndex, primitiveIndex, primary.CandidateTriangleBarycentrics())) {
+                primary.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
+
+    if (primary.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        writeNoHit(pixel, ray);
+        return;
+    }
+
+    const float hitT = primary.CommittedRayT();
+    float3 normal = triangleNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex());
+    if (dot(normal, ray.Direction) > 0.0f) {
+        normal = -normal;
+    }
+
+    if (gParams.mode == WCW_RT_MODE_HIT_NORMAL) {
+        gOutput[pixel] = float4(normal * 0.5f + 0.5f, 0.75f);
+        return;
+    }
+    else if (gParams.mode == WCW_RT_MODE_HIT_MESH) {
+        const uint id = primary.CommittedGeometryIndex();
+        const float3 hue = frac(float(id) * float3(0.618034f, 0.414214f, 0.732051f));
+        gOutput[pixel] = float4(hue, 0.75f);
+        return;
+    }
+    else if (gParams.mode == WCW_RT_MODE_HIT_DEPTH) {
+        const float shade = frac(hitT / 200.0f);
+        gOutput[pixel] = float4(shade, shade, shade, 0.75f);
+        return;
+    }
+
+    const float3 hitPos = ray.Origin + ray.Direction * hitT;
+    if (gParams.mode == WCW_RT_MODE_LIGHT_MAP) {
+        float4 color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float2 grid = abs(frac(hitPos.xz / 100.0f + 0.5f) - 0.5f) * 100.0f;
+        if (min(grid.x, grid.y) < 2.0f) {
+            color = float4(1.0f, 1.0f, 1.0f, 0.5f);
+        }
+
+        const float2 rel = hitPos.xz - gParams.lightPosition.xz;
+        if (abs(rel.y) < 4.0f) {
+            color = float4(1.0f, 0.2f, 0.2f, 0.9f);
+        }
+        else if (abs(rel.x) < 4.0f) {
+            color = float4(0.2f, 0.4f, 1.0f, 0.9f);
+        }
+
+        const uint count = min(gParams.lightListCount, WCW_RT_MAX_LIGHTS);
+        for (uint l = 0; l < count; l++) {
+            if (length(hitPos.xz - gParams.lights[l].xz) < 25.0f) {
+                color = float4(1.0f, 0.0f, 0.0f, 1.0f);
+            }
+        }
+
+        gOutput[pixel] = color;
+        return;
+    }
+
+    if (gParams.mode == WCW_RT_MODE_HIT_POSITION) {
+        // R/B: 50-unit X/Z grid; G: height in 0..300.
+        const float2 grid = step(0.5f, frac(hitPos.xz / 50.0f));
+        gOutput[pixel] = float4(grid.x, saturate(hitPos.y / 300.0f), grid.y, 0.85f);
+        return;
+    }
+
+    if (gParams.mode == WCW_RT_MODE_SHADOW_DISTANCE) {
+        // Key light only, closest hit: red = hit distance / light distance, blue = unoccluded.
+        const float3 toLight = gParams.lightPosition.xyz - hitPos;
+        const float lightDist = length(toLight);
+        RayDesc probe;
+        probe.Origin = hitPos + normal * 0.5f;
+        probe.Direction = toLight / lightDist;
+        probe.TMin = 0.5f;
+        probe.TMax = lightDist;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+        q.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, probe);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            gOutput[pixel] = float4(saturate(q.CommittedRayT() / lightDist), 0.0f, 0.0f, 0.85f);
+        }
+        else {
+            gOutput[pixel] = float4(0.0f, 0.0f, 1.0f, 0.85f);
+        }
+
+        return;
+    }
+
+    // Outside the receiver radius (arena, crowd): no shadow or AO rays, faded out over its
+    // last 15% so the cutoff has no visible edge.
+    float receiverFade = 0.0f;
+    if (resolvedMode() && (gParams.receiverRadius > 0.0f)) {
+        const float receiverDist = length(hitPos.xz - gParams.lightPosition.xz);
+        if (receiverDist >= gParams.receiverRadius) {
+            // Outside darkness (mirrors WcwLogic::outsideDarknessAt): the arena, the crowd and wrestlers out there fall into
+            // shadow; glows still brighten what they reach.
+            const float outside = outsideFactorAt(hitPos.xz);
+
+            // Glows add light on top of the darkened surface (not scaled by it), so a lamp's pool reaches full
+            // brightness under the lamp even in a dark room: the darkness is the missing ambient light.
+            gCurrent[pixel] = float4(outside + glowLight(hitPos, normal, pixel), 1.0f);
+            gCurrentDist[pixel] = hitT;
+            return;
+        }
+
+        receiverFade = smoothstep(gParams.receiverRadius * 0.85f, gParams.receiverRadius, receiverDist);
+    }
+
+    const uint lightCount = min(gParams.lightListCount, WCW_RT_MAX_LIGHTS);
+    float lightWeights[WCW_RT_MAX_LIGHTS];
+    float weightSum = 0.0f;
+    float weightMax = 0.0f;
+    for (uint w = 0; w < lightCount; w++) {
+        float lw = gParams.lights[w].w;
+        if (gParams.lightFalloff > 0.0f) {
+            const float d = length(gParams.lights[w].xyz - hitPos) / gParams.lightFalloff;
+            lw /= 1.0f + d * d;
+        }
+
+        lightWeights[w] = lw;
+        weightSum += lw;
+        weightMax = max(weightMax, lw);
+    }
+
+    // Smooth shadows on lit draws (wrestlers): facing from the smooth normal, rays from the lifted hit point.
+    const bool smoothShadow = (gParams.shadowSmooth != 0) && !((gParams.shadowSmoothSplit != 0) && (pixel.x < (gParams.resolution.x / 2)));
+    const float3 shadeNormal = smoothShadow ? smoothNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), normal) : normal;
+    const float3 shadowStart = smoothShadow ? shadowOrigin(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), hitPos, normal) : hitPos;
+
+    // Light reaching the pixel, in the lights' colors (white lights: the visible fraction of the total weight).
+    float3 lit = float3(0.0f, 0.0f, 0.0f);
+    // Wrestler sheen: highlights and backlight from the lights that reach the pixel (no extra rays).
+    const bool characterReceiver = (gMeshIndexStarts[primary.CommittedGeometryIndex()] & WCW_RT_MESH_CHARACTER) != 0;
+    const bool sheenOn = characterReceiver && ((gParams.sheenSpecular > 0.0f) || (gParams.sheenRim > 0.0f)) &&
+        !((gParams.sheenSplit != 0) && (pixel.x < (gParams.resolution.x / 2)));
+    const float3 viewDir = -ray.Direction;
+    const float rimEdge = pow(1.0f - saturate(dot(shadeNormal, viewDir)), max(gParams.sheenRimPower, 1.0f));
+    float3 sheen = float3(0.0f, 0.0f, 0.0f);
+    int occluderId = -1;
+    // Heavier lights cast proportionally darker shadows, so their sampling noise shows more:
+    // each light gets samples in proportion to its preset weight (key light 2 -> twice the rays).
+    uint i = 0;
+    for (uint l = 0; l < lightCount; l++)
+    for (uint s = 0, samples = max(gParams.samplesPerLight, 1) * uint(clamp(round(gParams.lights[l].w), 1.0f, 4.0f)); s < samples; s++, i++) {
+        // Area light: jittered samples on the light's panel (soft penumbrae, refined over
+        // frames by the resolve pass).
+        const float2 jitter = float2(sampleNoise(pixel, i * 2, uint2(0, 0)), sampleNoise(pixel, i * 2 + 1, uint2(37, 113))) - 0.5f;
+        const float2 offset = jitter * gParams.lightSize;
+        const float3 weight = (whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.lightColors[l].rgb) * (lightWeights[l] / max(weightSum, 1e-6f) / float(samples));
+        const float3 lightPos = gParams.lights[l].xyz + float3(offset.x, 0.0f, offset.y);
+        const float3 toLight = lightPos - shadowStart;
+        const float lightDist = length(toLight);
+
+        // Surfaces facing away from a light are already dark from N64 vertex lighting:
+        // only light-facing surfaces receive its shadow (no double darkening).
+        const float facing = dot(shadeNormal, toLight) / max(lightDist, 1e-6f);
+        if (facing <= 0.0f) {
+            lit += weight;
+            continue;
+        }
+
+        // Just past the terminator the vertex lighting is already dark too: the shadow fades in over terminatorFade.
+        const float shadowShare = smoothShadow ? smoothstep(0.0f, max(gParams.terminatorFade, 1e-4f), facing) : 1.0f;
+
+        // This sample's highlight and backlight, added below in proportion to how much of it gets through.
+        float3 sampleSheen = float3(0.0f, 0.0f, 0.0f);
+        if (sheenOn) {
+            const float3 toLightDir = toLight / max(lightDist, 1e-6f);
+            const float3 halfway = normalize(toLightDir + viewDir);
+            const float highlight = pow(saturate(dot(shadeNormal, halfway)), max(gParams.sheenShininess, 1.0f)) * facing;
+            // The outline facing a light: overhead TV lights rim the shoulders and heads as seen from the hard cam.
+            const float backlight = rimEdge * facing;
+            // Each light's sheen at its own strength relative to the strongest light (not its share of the total):
+            // a highlight from one light isn't dimmer because other lights exist.
+            const float3 sheenColor = whiteLight(pixel) ? float3(1.0f, 1.0f, 1.0f) : gParams.lightColors[l].rgb;
+            const float sheenWeight = lightWeights[l] / max(weightMax, 1e-6f) / float(samples);
+            sampleSheen = sheenColor * sheenWeight * (gParams.sheenSpecular * highlight + gParams.sheenRim * backlight);
+        }
+
+        RayDesc shadowRay;
+        shadowRay.Origin = shadowStart + normal * 0.5f;
+        shadowRay.Direction = toLight / lightDist;
+        shadowRay.TMin = 0.5f;
+        shadowRay.TMax = lightDist - gParams.lightClearance;
+        if (shadowRay.TMax <= shadowRay.TMin) {
+            lit += weight;
+            sheen += sampleSheen;
+            continue;
+        }
+
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> shadow;
+        shadow.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, shadowRay);
+        while (shadow.Proceed()) {
+            if (candidateIsSolid(shadow.CandidateInstanceID(), shadow.CandidateGeometryIndex(), shadow.CandidatePrimitiveIndex(), shadow.CandidateTriangleBarycentrics())) {
+                shadow.CommitNonOpaqueTriangleHit();
+            }
+        }
+
+        if (shadow.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            occluderId = int(shadow.CommittedGeometryIndex());
+            lit += weight * (1.0f - shadowShare);
+            sheen += sampleSheen * (1.0f - shadowShare);
+        }
+        else {
+            lit += weight;
+            sheen += sampleSheen;
+        }
+    }
+
+    if (gParams.mode == WCW_RT_MODE_SHADOW_OCCLUDER) {
+        if (occluderId >= 0) {
+            gOutput[pixel] = float4(frac(float(occluderId) * float3(0.618034f, 0.414214f, 0.732051f)), 0.75f);
+        }
+        else {
+            gOutput[pixel] = float4(1.0f, 1.0f, 1.0f, 0.0f);
+        }
+
+        return;
+    }
+
+    const float strength = characterReceiver ? gParams.characterShadowStrength : gParams.shadowStrength;
+    // Unlit share (1 - strength) plus the light that arrives, so white lights give 1 - strength * (1 - visible).
+    float3 factor = (1.0f - strength) + strength * lit;
+    if (gParams.mode == WCW_RT_MODE_SHEEN_RAW) {
+        gOutput[pixel] = float4(sheen, 1.0f);
+        return;
+    }
+
+    factor += sheen;
+    if (gParams.mode == WCW_RT_MODE_SHADOW_RAW) {
+        gOutput[pixel] = float4(factor, 1.0f);
+        return;
+    }
+
+
+    // Ambient occlusion: cosine-weighted hemisphere rays against all workloads' geometry, around the smooth
+    // normal on lit draws. Directions that dip below the flat triangle are mirrored back above it (no self-hits
+    // from the smoothing); a hit at distance t occludes by 1 - (t / radius)^2, so far hits fade in softly.
+    float ao = 1.0f;
+    const bool aoSplitOff = (gParams.aoSplit != 0) && (pixel.x < (gParams.resolution.x / 2));
+    if ((gParams.aoSamples > 0) && !aoSplitOff && (gParams.aoCycleOff == 0)) {
+        const float3 hemisphere = aoNormal(primary.CommittedGeometryIndex(), primary.CommittedPrimitiveIndex(), primary.CommittedTriangleBarycentrics(), normal);
+        const float3 helper = (abs(hemisphere.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+        const float3 tangent = normalize(cross(helper, hemisphere));
+        const float3 bitangent = cross(hemisphere, tangent);
+        const float aoRadius = characterReceiver ? gParams.aoCharacterRadius : gParams.aoRadius;
+        float occluded = 0.0f;
+        for (uint a = 0; a < gParams.aoSamples; a++) {
+            const float u = sampleNoise(pixel, 40 + a * 2, uint2(71, 29));
+            const float v = sampleNoise(pixel, 41 + a * 2, uint2(13, 97));
+            const float r = sqrt(u);
+            const float phi = 6.2831853f * v;
+            float3 dir = normalize(tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + hemisphere * sqrt(max(1.0f - u, 0.0f)));
+            const float below = dot(dir, normal);
+            if (below < 0.0f) {
+                dir = normalize(dir - 2.0f * below * normal);
+            }
+
+            RayDesc aoRay;
+            aoRay.Origin = hitPos + normal * 0.5f;
+            aoRay.Direction = dir;
+            aoRay.TMin = 0.5f;
+            aoRay.TMax = aoRadius;
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> ao;
+            ao.TraceRayInline(gScene, RAY_FLAG_NONE, 0xFF, aoRay);
+            while (ao.Proceed()) {
+                if (candidateIsSolid(ao.CandidateInstanceID(), ao.CandidateGeometryIndex(), ao.CandidatePrimitiveIndex(), ao.CandidateTriangleBarycentrics())) {
+                    ao.CommitNonOpaqueTriangleHit();
+                }
+            }
+
+            if (ao.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                const float reach = saturate(ao.CommittedRayT() / aoRadius);
+                occluded += 1.0f - reach * reach;
+            }
+        }
+
+        const float aoStrength = characterReceiver ? gParams.aoCharacterStrength : gParams.aoStrength;
+        const float aoGain = characterReceiver ? gParams.aoCharacterGain : gParams.aoGain;
+        const float aoFactor = 1.0f - aoStrength * saturate(aoGain * occluded / float(gParams.aoSamples));
+        if (gParams.mode == WCW_RT_MODE_AO_RAW) {
+            gOutput[pixel] = float4(aoFactor, aoFactor, aoFactor, 1.0f);
+            return;
+        }
+        ao = aoFactor;
+    }
+
+    // AO-only view: the shadow term stays open.
+    if (gParams.mode == WCW_RT_MODE_AO) {
+        factor = float3(1.0f, 1.0f, 1.0f);
+    }
+
+    factor = lerp(factor, float3(1.0f, 1.0f, 1.0f), receiverFade);
+    ao = lerp(ao, 1.0f, receiverFade);
+
+    if (resolvedMode() && (gParams.mode == WCW_RT_MODE_SHADOW)) {
+        factor *= 1.0f + glowLight(hitPos, normal, pixel);
+    }
+
+    gCurrent[pixel] = float4(factor, ao);
+    gCurrentDist[pixel] = hitT;
+}
