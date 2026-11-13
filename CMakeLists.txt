@@ -38,29 +38,34 @@ function(preprocess INFILE OUTFILE OPTIONS)
 endfunction()
 
 if (WIN32)
-    set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
     add_compile_definitions(NOMINMAX)
+endif()
+
+# DXC runs on the build host, so pick it by host OS/arch.
+if (CMAKE_HOST_WIN32)
+    set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
 
     # Dependencies that must be next to the DLL.
     configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll" "dxcompiler.dll" COPYONLY)
     configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxil.dll" "dxil.dll" COPYONLY)
-elseif (APPLE)
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-        # find zlib and include in dyld path
-        find_library(ZLIB_LIBRARY NAMES z)
-        get_filename_component(ZLIB_PATH ${ZLIB_LIBRARY} DIRECTORY)
+elseif (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    # DXC runs on the build host, so pick it by host OS/arch (matters when
+    # cross-compiling, e.g. for Android).
+    find_library(ZLIB_LIBRARY NAMES z)
+    get_filename_component(ZLIB_PATH ${ZLIB_LIBRARY} DIRECTORY)
 
-        set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64:${ZLIB_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-macos")
-        set (SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/x64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/x64/spirv-cross")
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set (DXC ${CMAKE_COMMAND} -E env "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64:${ZLIB_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-macos")
+        set (SPIRVCROSS ${CMAKE_COMMAND} -E env "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/x64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/x64/spirv-cross")
     else()
-        set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64:${ZLIB_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-macos")
-        set (SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/arm64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/arm64/spirv-cross")
+        set (DXC ${CMAKE_COMMAND} -E env "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64:${ZLIB_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-macos")
+        set (SPIRVCROSS ${CMAKE_COMMAND} -E env "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/arm64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/arm64/spirv-cross")
     endif()
 else()
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set (DXC ${CMAKE_COMMAND} -E env "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
     else()
-        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-linux")
+        set (DXC ${CMAKE_COMMAND} -E env "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-linux")
     endif()
 endif()
 
@@ -69,11 +74,22 @@ set(ZSTD_BUILD_STATIC ON)
 set(ZSTD_BUILD_SHARED OFF)
 
 add_subdirectory(src/tools/file_to_c)
+
+# file_to_c runs on the build host. When cross-compiling (e.g. Android) the
+# file_to_c target above is built for the target ABI and cannot execute here;
+# pass RT64_HOST_FILE_TO_C pointing at a host-built binary in that case.
+# CACHE so the value is visible in sibling scopes (recompui calls the shader
+# helper functions defined here from its own directory scope).
+set(RT64_HOST_FILE_TO_C file_to_c CACHE STRING "Host-runnable file_to_c executable used by shader embedding steps")
 add_subdirectory(src/contrib/re-spirv)
-add_subdirectory(src/contrib/nativefiledialog-extended)
+# The app may provide its own nfd target (e.g. the Android stub) before this
+# subdirectory is processed; nativefiledialog has no Android backend.
+if (NOT TARGET nfd)
+    add_subdirectory(src/contrib/nativefiledialog-extended)
+endif()
 add_subdirectory(src/contrib/zstd/build/cmake)
 
-if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+if (CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND RT64_SDL_WINDOW_VULKAN)
     set(PLUME_SDL_VULKAN_ENABLED TRUE)
 elseif (APPLE)
     set(PLUME_APPLE_RETINA_ENABLED OFF)
@@ -101,8 +117,18 @@ endif()
 set(ANDROID_PLATFORM android-24)
 set(ANDROID_ABI arm64-v8a)
 
+# Texture cache size shared by the shaders (via DXC -D) and the C++ descriptor
+# sets (via target_compile_definitions below).
+if (ANDROID)
+    # Mobile drivers choke on huge variable-count descriptor arrays.
+    set (RT64_TEXTURE_CACHE_SIZE 1024)
+else()
+    set (RT64_TEXTURE_CACHE_SIZE 8192)
+endif()
+
 # For DXC
 set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")
+list(APPEND DXC_COMMON_OPTS "-D" "RT64_TEXTURE_CACHE_SIZE=${RT64_TEXTURE_CACHE_SIZE}")
 set (DXC_DXIL_OPTS "-Wno-ignored-attributes")
 set (DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
 set (DXC_LB_OPTS "${DXC_COMMON_OPTS}" "-D" "LIBRARY" "-T" "lib_6_3")
@@ -123,7 +149,7 @@ function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         DEPENDS ${FILENAME}
         DEPFILE ${OUTNAME}.spv.d)
     add_custom_command(OUTPUT ${OUTNAME}.spirv.c
-        COMMAND file_to_c ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
+        COMMAND ${RT64_HOST_FILE_TO_C} ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
         DEPENDS ${OUTNAME}.spv file_to_c
         BYPRODUCTS ${OUTNAME}.spirv.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.spirv.c)
@@ -136,7 +162,7 @@ function(build_shader_dxil_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         DEPENDS ${FILENAME}
         DEPFILE ${OUTNAME}.dxil.d)
     add_custom_command(OUTPUT ${OUTNAME}.dxil.c
-        COMMAND file_to_c ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
+        COMMAND ${RT64_HOST_FILE_TO_C} ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
         DEPENDS ${OUTNAME}.dxil file_to_c
         BYPRODUCTS ${OUTNAME}.dxil.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.dxil.c)
@@ -158,7 +184,7 @@ function(build_shader_msl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
             COMMAND xcrun -sdk macosx metallib ${OUTNAME}.ir -o ${OUTNAME}.metallib
             DEPENDS ${OUTNAME}.ir)
     add_custom_command(OUTPUT ${OUTNAME}.metal.c
-            COMMAND file_to_c ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
+            COMMAND ${RT64_HOST_FILE_TO_C} ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
             DEPENDS ${OUTNAME}.metallib file_to_c
             BYPRODUCTS ${OUTNAME}.metal.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.metal.c)
@@ -252,7 +278,7 @@ function(preprocess_shader TARGETOBJ SHADERNAME)
     cmake_path(GET OUTNAME PARENT_PATH OUTPUT_DIR)
     preprocess(${FILENAME} ${OUTNAME}.rw ${DXC_COMMON_OPTS})
     add_custom_command(OUTPUT ${OUTNAME}.rw.c
-        COMMAND file_to_c ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
+        COMMAND ${RT64_HOST_FILE_TO_C} ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
         DEPENDS ${OUTNAME}.rw file_to_c
         BYPRODUCTS ${OUTNAME}.rw.h)
     file(MAKE_DIRECTORY ${OUTPUT_DIR})
@@ -310,7 +336,7 @@ add_compile_definitions(
     IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 )
 
-if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+if (CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND RT64_SDL_WINDOW_VULKAN)
     add_compile_definitions("PLUME_SDL_VULKAN_ENABLED")
     add_compile_definitions("RT64_SDL_WINDOW_VULKAN")
 endif()
@@ -458,6 +484,9 @@ endif()
 
 set_target_properties(rt64 PROPERTIES OUTPUT_NAME "rt64")
 set_target_properties(rt64 PROPERTIES PREFIX "")
+
+# Keep the C++ descriptor set bounds in sync with the shader texture cache arrays.
+target_compile_definitions(rt64 PUBLIC "RT64_TEXTURE_CACHE_SIZE=${RT64_TEXTURE_CACHE_SIZE}")
 
 # Add common libraries.
 target_link_libraries(rt64 re-spirv)

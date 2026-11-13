@@ -24,7 +24,15 @@ namespace RT64 {
     std::filesystem::path UserPaths::detectDataPath(const std::filesystem::path &appId) {
         std::filesystem::path resultPath;
 
-#   if defined(_WIN32)
+#   if defined(__ANDROID__)
+        // Bionic reports "/data" as the home directory for app uids, which is
+        // not writable. Use the app-scoped folder exported by the activity.
+        // Must be checked before __linux__ (also defined on Android).
+        const char *appFolder = getenv("APP_FOLDER_PATH");
+        if (appFolder != nullptr && appFolder[0] != '\0') {
+            resultPath = std::filesystem::path{ appFolder } / appId;
+        }
+#   elif defined(_WIN32)
         PWSTR knownPath = NULL;
         HRESULT result = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &knownPath);
         if (result == S_OK) {

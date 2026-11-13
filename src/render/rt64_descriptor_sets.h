@@ -290,8 +290,16 @@ namespace RT64 {
         }
     };
 
+// Size of the shader texture cache arrays. Normally injected by the build
+// system (the same value is passed to DXC); fall back to the upstream default.
+#ifndef RT64_TEXTURE_CACHE_SIZE
+#   define RT64_TEXTURE_CACHE_SIZE 8192
+#endif
+
     struct FramebufferRendererDescriptorTextureSet : RenderDescriptorSetBase {
-        static const int UpperRange = 8192;
+        // Mobile drivers choke on huge variable-count descriptor arrays, so
+        // Android builds define a smaller RT64_TEXTURE_CACHE_SIZE (see CMakeLists.txt).
+        static const int UpperRange = RT64_TEXTURE_CACHE_SIZE;
 
         uint32_t textureCacheSize = 0;
         uint32_t gTextures;
@@ -303,7 +311,11 @@ namespace RT64 {
             builder.begin();
             gTextures = builder.addTexture(0, UpperRange);
             gTMEM = gTextures;
+#if defined(__ANDROID__)
+            builder.end();
+#else
             builder.end(true, textureCacheSize);
+#endif
 
             if (device != nullptr) {
                 create(device);

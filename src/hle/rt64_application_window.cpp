@@ -127,7 +127,22 @@ namespace RT64 {
         bounds.width = rect.right - rect.left;
         bounds.height = rect.bottom - rect.top;
 #   elif defined(__ANDROID__)
-        static_assert(false && "Android unimplemented");
+        if (SDL_VideoInit(nullptr) != 0) {
+            printf("Failed to init SDL2 video: %s\n", SDL_GetError());
+            assert(false && "Failed to init SDL2 video");
+            return;
+        }
+        SDL_DisplayMode dm;
+        if (SDL_GetCurrentDisplayMode(0, &dm) != 0) {
+            printf("Failed to get SDL2 current display mode: %s\n", SDL_GetError());
+            assert(false && "Failed to get SDL2 current display mode");
+            return;
+        }
+        // The window always covers the whole display on Android.
+        bounds.left = 0;
+        bounds.top = 0;
+        bounds.width = dm.w;
+        bounds.height = dm.h;
 #   elif defined(__linux__) || defined(__APPLE__)
         if (SDL_VideoInit(nullptr) != 0) {
             printf("Failed to init SDL2 video: %s\n", SDL_GetError());
@@ -159,6 +174,9 @@ namespace RT64 {
         # elif defined(RT64_SDL_WINDOW_VULKAN)
         flags |= SDL_WINDOW_VULKAN;
         #endif
+#       if defined(__ANDROID__)
+        flags |= SDL_WINDOW_FULLSCREEN;
+#       endif
         sdlWindow = SDL_CreateWindow(windowTitle, bounds.left, bounds.top, bounds.width, bounds.height, flags);
         assert((sdlWindow != nullptr) && "Failed to open window with SDL");
 

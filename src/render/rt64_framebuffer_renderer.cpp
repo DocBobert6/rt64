@@ -551,6 +551,10 @@ namespace RT64 {
             textureCacheFreeSpaces.pop_back();
         }
 
+        // Catch texture cache overflow in debug builds instead of silently
+        // indexing past the shader's descriptor arrays.
+        assert(dstIndex < uint32_t(RT64_TEXTURE_CACHE_SIZE));
+
         return dstIndex;
     }
     
