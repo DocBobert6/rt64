@@ -90,6 +90,25 @@ namespace RT64 {
         renderTargetManager.setMultisampling(multisampling);
         renderTargetManager.setUsesHDR(ext.shaderLibrary->usesHDR);
         updateRenderFlagSampleCount();
+        // [wcw alpha.8] Graphics diagnostics: log the effective configuration
+        // once at startup so a device log names exactly what the phone
+        // rendered with. The alpha.7 log carried only the MSAA line, so the
+        // resolution/aspect/filter/upscale the phone used were unknown while
+        // its screenshots showed garbled 2D + wrong colors. Enums as ints:
+        // Resolution 0=Original 1=WindowIntegerScale 2=Manual; Antialiasing
+        // 0=None 1=2X 2=4X 3=8X; Filtering 0=Nearest 1=Linear
+        // 2=AntiAliasedPixelScaling; AspectRatio 0=Original 1=Expand 2=Manual;
+        // Upscale2D 0=Original 1=ScaledOnly 2=All; RefreshRate 0=Original
+        // 1=Display 2=Manual. msaaReq is the config value, msaaEff is the
+        // sample count after the resolve workaround (forced to 1).
+        fprintf(stderr, "[wcw][gfxcfg] resolution=%d resMult=%.2f aspect=%d aspectTarget=%.3f msaaReq=%u msaaEff=%u filtering=%d upscale2D=%d downsample=%d hdr=%d refreshRate=%d refreshTarget=%d sampleLocations=%d\n",
+            (int)ext.userConfig->resolution, ext.userConfig->resolutionMultiplier,
+            (int)ext.userConfig->aspectRatio, ext.userConfig->aspectTarget,
+            ext.userConfig->msaaSampleCount(), multisampling.sampleCount,
+            (int)ext.userConfig->filtering, (int)ext.userConfig->upscale2D,
+            ext.userConfig->downsampleMultiplier, (int)ext.shaderLibrary->usesHDR,
+            (int)ext.userConfig->refreshRate, ext.userConfig->refreshRateTarget,
+            (int)ext.device->getCapabilities().sampleLocations);
     }
 
     void State::reset() {

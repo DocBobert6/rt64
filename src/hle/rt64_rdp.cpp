@@ -1351,9 +1351,13 @@ namespace RT64 {
         { static int tr = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (tr++ % 200) == 0) {
             const hlslpp::float4& pc = primColorStack[primColorStackSize - 1];
             const hlslpp::float4& ec = envColorStack[envColorStackSize - 1];
-            fprintf(stderr, "[wcw][texrect#%d] (%d,%d)-(%d,%d) tilefmt=%d tilesiz=%d tlut=0x%X prim=(%.2f,%.2f,%.2f,%.2f) cc=0x%08X%08X\n",
+            // [wcw alpha.11] Also log the texture coordinates (raw RDP
+            // fixed-point) and the tile line stride, so the phone's 2D draws
+            // compare 1:1 with the Linux trace for the same screen.
+            fprintf(stderr, "[wcw][texrect#%d] (%d,%d)-(%d,%d) tilefmt=%d tilesiz=%d tlut=0x%X uv=(%d,%d)+(%d,%d) tileline=%d prim=(%.2f,%.2f,%.2f,%.2f) cc=0x%08X%08X\n",
                 tr, ulx>>2, uly>>2, lrx>>2, lry>>2,
                 (int)tiles[tile].fmt, (int)tiles[tile].siz, (unsigned)otherMode.textLUT(),
+                (int)uls, (int)ult, (int)dsdx, (int)dtdy, (int)tiles[tile].line,
                 (float)pc.x, (float)pc.y, (float)pc.z, (float)pc.w,
                 (unsigned)colorCombinerStack[colorCombinerStackSize-1].H, (unsigned)colorCombinerStack[colorCombinerStackSize-1].L); (void)ec; } }
 #   ifdef LOG_TEXRECT_METHODS

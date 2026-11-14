@@ -460,6 +460,18 @@ namespace RT64 {
                 const RenderTexture *swapChainTexture = ext.swapChain->getTexture(i);
                 swapChainFramebuffers[i] = ext.device->createFramebuffer(RenderFramebufferDesc(&swapChainTexture, 1));
             }
+            // [wcw alpha.11] DIAGNOSTIC: log the negotiated present surface
+            // once per (re)creation — size, image count, color space
+            // (0=SRGB_NONLINEAR, 1=SCRGB_LINEAR, 2=HDR10_ST2084) and vsync.
+            // Settles whether the phone presents in a different color space
+            // than Linux; the swap-chain texture format has no interface
+            // getter, so it is not logged here (it is B8G8R8A8_UNORM as
+            // requested by the frontend, and Vulkan encodes the shader
+            // output per the attachment format, so it cannot swap channels).
+            fprintf(stderr, "[wcw][swapchain] size=%ux%u images=%u colorSpace=%d vsync=%d\n",
+                (unsigned)ext.swapChain->getWidth(), (unsigned)ext.swapChain->getHeight(),
+                (unsigned)textureCount, (int)ext.swapChain->getColorSpace(),
+                (int)ext.swapChain->isVsyncEnabled());
         }
         
         // [wcw] DIAGNOSTIC (env WCW_PRESENT_LOG=1): if framesToPresent is 0, nothing is ever
